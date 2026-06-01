@@ -3,6 +3,8 @@
 #import <AppKit/AppKit.h>
 #import <ApplicationServices/ApplicationServices.h>
 #import <Foundation/Foundation.h>
+#include <cstdlib>
+#include <cstring>
 #import <array>
 
 /**
@@ -33,7 +35,8 @@ AXError _AXUIElementGetWindow(AXUIElementRef, CGWindowID *out);
 static void checkAndHandleWindow(pid_t pid, AXUIElementRef frontmostWindow);
 
 struct ow_target_window {
-  const char *title;
+  char** titles;
+  size_t titles_count;
   /** Set to -1 if not initialized yet */
   pid_t pid;
   /** Window matching the target title, or null */
@@ -65,7 +68,8 @@ struct ow_frontmost_app {
  * function for more centralized logic.
  */
 static struct ow_target_window targetInfo = {
-    .title = NULL,
+    .titles = NULL,
+    .titles_count = 0,
     .pid = -1,
     .element = NULL,
     .observer = NULL,
@@ -299,7 +303,10 @@ static void hookProcTargetWindow(AXObserverRef observer, AXUIElementRef element,
           isEqualToString:(__bridge NSString *)kAXTitleChangedNotification]) {
     NSString *title = getTitleForWindow(element);
     if (title) {
-      targetInfo.title = [title UTF8String];
+      if (targetInfo.titles_count > 0 && targetInfo.titles[0]) {
+        free(targetInfo.titles[0]);
+        targetInfo.titles[0] = strdup([title UTF8String]);
+      }
     }
   }
 }
@@ -505,7 +512,16 @@ static void checkAndHandleWindow(pid_t pid, AXUIElementRef frontmostWindow) {
 
   // For the rest of this function, only run if the title matches
   NSString *title = getTitleForWindow(frontmostWindow);
-  if (!title || ![title isEqualToString:@(targetInfo.title)]) {
+  int matched_index = -1;
+  if (title) {
+    for (size_t i = 0; i < targetInfo.titles_count; i++) {
+      if (targetInfo.titles[i] && [title isEqualToString:@(targetInfo.titles[i])]) {
+        matched_index = (int)i;
+        break;
+      }
+    }
+  }
+  if (matched_index < 0) {
     return;
   }
 
@@ -527,8 +543,7 @@ static void checkAndHandleWindow(pid_t pid, AXUIElementRef frontmostWindow) {
   // Emit the attach and focus events
   struct ow_event e = {
       .type = OW_ATTACH,
-      // has_access is set to -1 for undefined
-      .data.attach = {.has_access = -1, .is_fullscreen = fullscreen}};
+      .data.attach = {.has_access = -1, .is_fullscreen = fullscreen, .title_index = matched_index}};
   bool getBoundsSuccess = getBounds(frontmostWindowID, &e.data.attach.bounds);
   if (getBoundsSuccess) {
     // emit OW_ATTACH
@@ -635,8 +650,18 @@ static void hookThread(void *_arg) {
   CFRunLoopRun();
 }
 
-void ow_start_hook(char *target_window_title, void *overlay_window_id) {
-  targetInfo.title = target_window_title;
+void ow_start_hook(char** target_window_titles, size_t titles_count, void* overlay_window_id) {
+  if (targetInfo.titles) {
+    for (size_t i = 0; i < targetInfo.titles_count; i++) {
+      free(targetInfo.titles[i]);
+    }
+    free(targetInfo.titles);
+  }
+  targetInfo.titles = (char**)malloc(sizeof(char*) * titles_count);
+  targetInfo.titles_count = titles_count;
+  for (size_t i = 0; i < titles_count; i++) {
+    targetInfo.titles[i] = strdup(target_window_titles[i]);
+  }
   if (overlay_window_id != NULL) {
     // Cast to a weak pointer to avoid taking ownership of the view
     NSView *overlayView = *(NSView * __weak *)(overlay_window_id);
@@ -660,4 +685,34 @@ void ow_focus_target() {
   AXUIElementSetAttributeValue(app, kAXFrontmostAttribute, kCFBooleanTrue);
   AXUIElementRef window = targetInfo.element;
   AXUIElementSetAttributeValue(window, kAXMainAttribute, kCFBooleanTrue);
+}
+
+void ow_set_target_titles(char** titles, size_t count) {
+  if (targetInfo.titles) {
+    for (size_t i = 0; i < targetInfo.titles_count; i++) {
+      free(targetInfo.titles[i]);
+    }
+    free(targetInfo.titles);
+  }
+  targetInfo.titles = (char**)malloc(sizeof(char*) * count);
+  targetInfo.titles_count = count;
+  for (size_t i = 0; i < count; i++) {
+    targetInfo.titles[i] = strdup(titles[i]);
+  }
+}
+
+void ow_clear_target(void) {
+  if (targetInfo.titles) {
+    for (size_t i = 0; i < targetInfo.titles_count; i++) {
+      free(targetInfo.titles[i]);
+    }
+    free(targetInfo.titles);
+  }
+  targetInfo.titles = NULL;
+  targetInfo.titles_count = 0;
+}
+
+void ow_stop_hook(void) {
+  CFRunLoopStop([[NSRunLoop currentRunLoop] getCFRunLoop]);
+  uv_thread_join(&hook_tid);
 }
