@@ -1,0 +1,13 @@
+If:
+  PathMatch:
+    - "src/lib/x11\\.c"
+    - "src/lib/mac\\.mm"
+    - "src/lib/mac/.+"
+Diagnostics:
+  Suppress: "*"
+---
+CompileFlags:
+  Add:
+    - "-IC:/Users/d/AppData/Local/node-gyp/Cache/25.0.0/include/node"
+    - "-Isrc/lib"
+    - "-DWIN32_LEAN_AND_MEAN"

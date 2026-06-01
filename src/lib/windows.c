@@ -10,7 +10,8 @@
 
 struct ow_target_window
 {
-  char* title;
+  char** titles;
+  size_t titles_count;
   HWND hwnd;
   HWINEVENTHOOK location_hook;
   HWINEVENTHOOK destroy_hook;
@@ -26,9 +27,12 @@ struct ow_overlay_window
 static HWND foreground_window = NULL;
 static HWINEVENTHOOK fg_window_namechange_hook = NULL;
 static UINT WM_OVERLAY_UIPI_TEST = WM_NULL;
+static uv_mutex_t target_mutex;
+static DWORD hook_thread_id = 0;
 
 static struct ow_target_window target_info = {
-  .title = NULL,
+  .titles = NULL,
+  .titles_count = 0,
   .hwnd = NULL,
   .location_hook = NULL,
   .destroy_hook = NULL,
@@ -173,9 +177,15 @@ static void check_and_handle_window(HWND hwnd, struct ow_target_window* target_i
   if (!get_title(hwnd, &title) || title == NULL) {
     return;
   }
-  bool is_equal = (strcmp(title, target_info->title) == 0);
+  int matched_index = -1;
+  for (size_t i = 0; i < target_info->titles_count; i++) {
+    if (target_info->titles[i] && strcmp(title, target_info->titles[i]) == 0) {
+      matched_index = (int)i;
+      break;
+    }
+  }
   free(title);
-  if (!is_equal) {
+  if (matched_index < 0) {
     return;
   }
 
@@ -205,7 +215,8 @@ static void check_and_handle_window(HWND hwnd, struct ow_target_window* target_i
     .type = OW_ATTACH,
     .data.attach = {
       .has_access = -1,
-      .is_fullscreen = -1
+      .is_fullscreen = -1,
+      .title_index = matched_index,
     }
   };
   e.data.attach.has_access = has_uipi_access(target_info->hwnd);
@@ -309,6 +320,8 @@ static VOID CALLBACK foreground_timer_proc(HWND _hwnd, UINT msg, UINT_PTR timerI
 }
 
 static void hook_thread(void* _arg) {
+  hook_thread_id = GetCurrentThreadId();
+
   SetWinEventHook(
     EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND,
     NULL, hook_proc, 0, 0, WINEVENT_OUTOFCONTEXT);
@@ -335,13 +348,85 @@ static void hook_thread(void* _arg) {
   }
 }
 
-void ow_start_hook(char* target_window_title, void* overlay_window_id) {
-  target_info.title = target_window_title;
+void ow_start_hook(char** target_window_titles, size_t titles_count, void* overlay_window_id) {
+  uv_mutex_init(&target_mutex);
+  target_info.titles = target_window_titles;
+  target_info.titles_count = titles_count;
   if (overlay_window_id != NULL) {
     overlay_info.hwnd = *((HWND*)overlay_window_id);
   }
   WM_OVERLAY_UIPI_TEST = RegisterWindowMessage("ELECTRON_OVERLAY_UIPI_TEST");
   uv_thread_create(&hook_tid, hook_thread, NULL);
+}
+
+void ow_set_target_titles(char** titles, size_t count) {
+  uv_mutex_lock(&target_mutex);
+
+  if (target_info.hwnd != NULL) {
+    UnhookWinEvent(target_info.location_hook);
+    UnhookWinEvent(target_info.destroy_hook);
+    target_info.location_hook = NULL;
+    target_info.destroy_hook = NULL;
+    target_info.hwnd = NULL;
+    target_info.is_focused = false;
+    target_info.is_destroyed = false;
+
+    struct ow_event e = { .type = OW_DETACH };
+    ow_emit_event(&e);
+  }
+
+  if (target_info.titles) {
+    for (size_t i = 0; i < target_info.titles_count; i++) {
+      free(target_info.titles[i]);
+    }
+    free(target_info.titles);
+  }
+  target_info.titles = titles;
+  target_info.titles_count = count;
+
+  uv_mutex_unlock(&target_mutex);
+
+  HWND fg = GetForegroundWindow();
+  if (fg != NULL) {
+    check_and_handle_window(fg, &target_info);
+  }
+}
+
+void ow_clear_target(void) {
+  uv_mutex_lock(&target_mutex);
+
+  if (target_info.hwnd != NULL) {
+    UnhookWinEvent(target_info.location_hook);
+    UnhookWinEvent(target_info.destroy_hook);
+    target_info.location_hook = NULL;
+    target_info.destroy_hook = NULL;
+    target_info.hwnd = NULL;
+    target_info.is_focused = false;
+    target_info.is_destroyed = false;
+
+    struct ow_event e = { .type = OW_DETACH };
+    ow_emit_event(&e);
+  }
+
+  if (target_info.titles) {
+    for (size_t i = 0; i < target_info.titles_count; i++) {
+      free(target_info.titles[i]);
+    }
+    free(target_info.titles);
+  }
+  target_info.titles = NULL;
+  target_info.titles_count = 0;
+
+  uv_mutex_unlock(&target_mutex);
+}
+
+void ow_stop_hook(void) {
+  if (hook_thread_id != 0) {
+    PostThreadMessage(hook_thread_id, WM_QUIT, 0, 0);
+  }
+  uv_thread_join(&hook_tid);
+  hook_thread_id = 0;
+  uv_mutex_destroy(&target_mutex);
 }
 
 void ow_activate_overlay() {
@@ -368,7 +453,7 @@ void ow_screenshot(uint8_t* out, uint32_t width, uint32_t height) {
   HDC dcSrc = GetDC(GetDesktopWindow());
   HDC dcDest = CreateCompatibleDC(dcSrc);
   uint8_t* bmpData;
-  HBITMAP bmp = CreateDIBSection(dcSrc, (BITMAPINFO*)&bi, DIB_RGB_COLORS, &bmpData, NULL, 0);
+  HBITMAP bmp = CreateDIBSection(dcSrc, (BITMAPINFO*)&bi, DIB_RGB_COLORS, (void**)&bmpData, NULL, 0);
   SelectObject(dcDest, bmp);
   BitBlt(dcDest, 0, 0, width, height, dcSrc, screenPos.x, screenPos.y, SRCCOPY);
 

@@ -5,6 +5,7 @@
 extern "C" {
 #endif
 
+#include <stddef.h>
 #include <stdint.h>
 #include <uv.h>
 
@@ -36,6 +37,8 @@ struct ow_event_attach {
   int has_access;
   // defined only on Linux, only if changed
   int is_fullscreen;
+  // index into the titles array that matched (0-based), or -1 if unknown
+  int title_index;
   //
   struct ow_window_bounds bounds;
 };
@@ -59,10 +62,13 @@ struct ow_event {
 
 static uv_thread_t hook_tid;
 
-// Passed the title and a pointer to the platform-specific window ID.
-// Window ID format depends on platform, see
-// https://www.electronjs.org/docs/api/browser-window#wingetnativewindowhandle
-void ow_start_hook(char* target_window_title, void* overlay_window_id);
+void ow_start_hook(char** target_window_titles, size_t titles_count, void* overlay_window_id);
+
+void ow_set_target_titles(char** titles, size_t count);
+
+void ow_clear_target(void);
+
+void ow_stop_hook(void);
 
 void ow_activate_overlay();
 

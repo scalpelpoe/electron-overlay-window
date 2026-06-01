@@ -8,13 +8,16 @@ const lib: AddonExports = require('node-gyp-build')(join(__dirname, '..'))
 interface AddonExports {
   start(
     overlayWindowId: Buffer | undefined,
-    targetWindowTitle: string,
+    targetWindowTitles: string[],
     cb: (e: any) => void
   ): void
 
   activateOverlay(): void
   focusTarget(): void
   screenshot(): Buffer
+  setTargetTitles(titles: string[]): void
+  clearTarget(): void
+  stopHook(): void
 }
 
 enum EventType {
@@ -29,6 +32,7 @@ enum EventType {
 export interface AttachEvent {
   hasAccess: boolean | undefined
   isFullscreen: boolean | undefined
+  titleIndex: number
   x: number
   y: number
   width: number
@@ -262,6 +266,10 @@ class OverlayControllerGlobal {
   }
 
   attachByTitle (electronWindow: BrowserWindow | undefined, targetWindowTitle: string, options: AttachOptions = {}) {
+    this.attachByTitles(electronWindow, [targetWindowTitle], options)
+  }
+
+  attachByTitles (electronWindow: BrowserWindow | undefined, targetWindowTitles: string[], options: AttachOptions = {}) {
     if (this.isInitialized) {
       throw new Error('Library can be initialized only once.')
     } else {
@@ -286,8 +294,20 @@ class OverlayControllerGlobal {
 
     lib.start(
       this.electronWindow?.getNativeWindowHandle(),
-      targetWindowTitle,
+      targetWindowTitles,
       this.handler.bind(this))
+  }
+
+  setTargetTitles (titles: string[]) {
+    lib.setTargetTitles(titles)
+  }
+
+  clearTarget () {
+    lib.clearTarget()
+  }
+
+  stopHook () {
+    lib.stopHook()
   }
 
   // buffer suitable for use in `nativeImage.createFromBitmap`

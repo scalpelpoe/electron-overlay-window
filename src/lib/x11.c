@@ -15,7 +15,8 @@ static xcb_atom_t ATOM_NET_WM_STATE_FULLSCREEN;
 
 struct ow_target_window
 {
-  char* title;
+  char** titles;
+  size_t titles_count;
   xcb_window_t window_id;
   bool is_focused;
   bool is_destroyed;
@@ -28,13 +29,16 @@ struct ow_overlay_window
 };
 
 static xcb_window_t active_window = XCB_WINDOW_NONE;
+static uv_mutex_t target_mutex;
+static bool hook_running = false;
 
 static struct ow_target_window target_info = {
-  .title = NULL,
+  .titles = NULL,
+  .titles_count = 0,
   .window_id = XCB_WINDOW_NONE,
   .is_focused = false,
   .is_destroyed = false,
-  .is_fullscreen = false // initial state of *overlay* window
+  .is_fullscreen = false
 };
 
 static struct ow_overlay_window overlay_info = {
@@ -169,9 +173,15 @@ static void check_and_handle_window(xcb_window_t wid, struct ow_target_window* t
   if (!get_title(wid, &title) || title == NULL) {
     return;
   }
-  bool is_equal = (strcmp(title, target_info->title) == 0);
+  int matched_index = -1;
+  for (size_t i = 0; i < target_info->titles_count; i++) {
+    if (target_info->titles[i] && strcmp(title, target_info->titles[i]) == 0) {
+      matched_index = (int)i;
+      break;
+    }
+  }
   free(title);
-  if (!is_equal) {
+  if (matched_index < 0) {
     return;
   }
 
@@ -190,7 +200,8 @@ static void check_and_handle_window(xcb_window_t wid, struct ow_target_window* t
     .type = OW_ATTACH,
     .data.attach = {
       .has_access = -1,
-      .is_fullscreen = -1
+      .is_fullscreen = -1,
+      .title_index = matched_index,
     }
   };
   bool is_fullscreen;
@@ -257,6 +268,7 @@ static void hook_proc(xcb_generic_event_t* generic_event) {
 
 static void hook_thread(void* _arg) {
   x_conn = xcb_connect(NULL, NULL);
+  hook_running = true;
   xcb_screen_t* screen = xcb_setup_roots_iterator(xcb_get_setup(x_conn)).data;
   root = screen->root;
 
@@ -298,20 +310,93 @@ static void hook_thread(void* _arg) {
   xcb_flush(x_conn);
 
   xcb_generic_event_t* event;
-  while ((event = xcb_wait_for_event(x_conn))) {
+  while (hook_running && (event = xcb_wait_for_event(x_conn))) {
     event->response_type = event->response_type & ~0x80;
     hook_proc(event);
     xcb_flush(x_conn);
     free(event);
   }
+  xcb_disconnect(x_conn);
+  x_conn = NULL;
 }
 
-void ow_start_hook(char* target_window_title, void* overlay_window_id) {
-  target_info.title = target_window_title;
+void ow_start_hook(char** target_window_titles, size_t titles_count, void* overlay_window_id) {
+  uv_mutex_init(&target_mutex);
+  target_info.titles = target_window_titles;
+  target_info.titles_count = titles_count;
   if (overlay_window_id != NULL) {
     overlay_info.window_id = *((xcb_window_t*)overlay_window_id);
   }
   uv_thread_create(&hook_tid, hook_thread, NULL);
+}
+
+void ow_set_target_titles(char** titles, size_t count) {
+  uv_mutex_lock(&target_mutex);
+
+  if (target_info.window_id != XCB_WINDOW_NONE) {
+    uint32_t mask[] = { XCB_EVENT_MASK_NO_EVENT };
+    xcb_change_window_attributes(x_conn, target_info.window_id, XCB_CW_EVENT_MASK, mask);
+    target_info.window_id = XCB_WINDOW_NONE;
+    target_info.is_focused = false;
+    target_info.is_destroyed = false;
+
+    struct ow_event e = { .type = OW_DETACH };
+    ow_emit_event(&e);
+  }
+
+  if (target_info.titles) {
+    for (size_t i = 0; i < target_info.titles_count; i++) {
+      free(target_info.titles[i]);
+    }
+    free(target_info.titles);
+  }
+  target_info.titles = titles;
+  target_info.titles_count = count;
+
+  uv_mutex_unlock(&target_mutex);
+
+  if (x_conn) {
+    xcb_window_t active = get_active_window();
+    if (active != XCB_WINDOW_NONE) {
+      check_and_handle_window(active, &target_info);
+    }
+  }
+}
+
+void ow_clear_target(void) {
+  uv_mutex_lock(&target_mutex);
+
+  if (target_info.window_id != XCB_WINDOW_NONE) {
+    uint32_t mask[] = { XCB_EVENT_MASK_NO_EVENT };
+    xcb_change_window_attributes(x_conn, target_info.window_id, XCB_CW_EVENT_MASK, mask);
+    target_info.window_id = XCB_WINDOW_NONE;
+    target_info.is_focused = false;
+    target_info.is_destroyed = false;
+
+    struct ow_event e = { .type = OW_DETACH };
+    ow_emit_event(&e);
+  }
+
+  if (target_info.titles) {
+    for (size_t i = 0; i < target_info.titles_count; i++) {
+      free(target_info.titles[i]);
+    }
+    free(target_info.titles);
+  }
+  target_info.titles = NULL;
+  target_info.titles_count = 0;
+
+  uv_mutex_unlock(&target_mutex);
+}
+
+void ow_stop_hook(void) {
+  hook_running = false;
+  if (x_conn) {
+    xcb_disconnect(x_conn);
+    x_conn = NULL;
+  }
+  uv_thread_join(&hook_tid);
+  uv_mutex_destroy(&target_mutex);
 }
 
 void ow_activate_overlay() {
