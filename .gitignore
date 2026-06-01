@@ -119,3 +119,4 @@ prebuilds
 
 # Mac storage
 .DS_Store
+.idea/
