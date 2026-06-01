@@ -6,7 +6,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/SnosMe/electron-overlay-window.git"
+    "url": "https://github.com/scalpelpoe/electron-overlay-window.git"
   },
   "license": "MIT",
   "keywords": [
@@ -48,6 +48,6 @@
     "node": ">= 20"
   },
   "peerDependencies": {
-    "electron": ">= 35"
+    "electron": ">= 32"
   }
 }
