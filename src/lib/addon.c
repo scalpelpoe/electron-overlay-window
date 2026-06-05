@@ -20,7 +20,16 @@ void ow_emit_event(struct ow_event* event) {
     free(copied_event);
     return;
   }
-  NAPI_FATAL_IF_FAILED(status, "ow_emit_event", "napi_call_threadsafe_function");
+  if (status == napi_queue_full) {
+    fprintf(stderr, "[electron-overlay-window] tsfn queue full, dropping event\n");
+    free(copied_event);
+    return;
+  }
+  if (status != napi_ok) {
+    fprintf(stderr, "[electron-overlay-window] napi_call_threadsafe_function failed: %d\n", status);
+    free(copied_event);
+    return;
+  }
 }
 
 napi_value ow_event_to_js_object(napi_env env, struct ow_event* event) {
@@ -154,10 +163,25 @@ void tsfn_to_js_proxy(napi_env env, napi_value js_callback, void* context, void*
 
   napi_value global;
   status = napi_get_global(env, &global);
-  NAPI_FATAL_IF_FAILED(status, "tsfn_to_js_proxy", "napi_get_global");
+  if (status != napi_ok) {
+    fprintf(stderr, "[electron-overlay-window] napi_get_global failed: %d\n", status);
+    free(event);
+    return;
+  }
 
   status = napi_call_function(env, global, js_callback, 1, &event_obj, NULL);
-  NAPI_FATAL_IF_FAILED(status, "tsfn_to_js_proxy", "napi_call_function");
+  if (status == napi_pending_exception) {
+    napi_value error;
+    napi_get_and_clear_last_exception(env, &error);
+    napi_value error_str;
+    napi_coerce_to_string(env, error, &error_str);
+    char buf[512];
+    size_t len;
+    napi_get_value_string_utf8(env, error_str, buf, sizeof(buf), &len);
+    fprintf(stderr, "[electron-overlay-window] JS callback threw: %s\n", buf);
+  } else if (status != napi_ok) {
+    fprintf(stderr, "[electron-overlay-window] napi_call_function failed: %d\n", status);
+  }
 
   free(event);
 }

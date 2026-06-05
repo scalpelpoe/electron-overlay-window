@@ -50,6 +50,10 @@ static xcb_window_t get_active_window() {
   if (prop_reply == NULL) {
     return XCB_WINDOW_NONE;
   }
+  if (xcb_get_property_value_length(prop_reply) < (int)sizeof(xcb_window_t)) {
+    free(prop_reply);
+    return XCB_WINDOW_NONE;
+  }
   xcb_window_t active_window = *((xcb_window_t*)xcb_get_property_value(prop_reply));
   free(prop_reply);
   return active_window;
@@ -268,6 +272,12 @@ static void hook_proc(xcb_generic_event_t* generic_event) {
 
 static void hook_thread(void* _arg) {
   x_conn = xcb_connect(NULL, NULL);
+  if (xcb_connection_has_error(x_conn)) {
+    fprintf(stderr, "[electron-overlay-window] xcb_connect failed\n");
+    xcb_disconnect(x_conn);
+    x_conn = NULL;
+    return;
+  }
   hook_running = true;
   xcb_screen_t* screen = xcb_setup_roots_iterator(xcb_get_setup(x_conn)).data;
   root = screen->root;

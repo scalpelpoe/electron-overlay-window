@@ -60,12 +60,11 @@ const isLinux = process.platform === 'linux'
 
 export const OVERLAY_WINDOW_OPTS: BrowserWindowConstructorOptions = {
   fullscreenable: true,
-  skipTaskbar: !isLinux,
+  skipTaskbar: true,
   frame: false,
   show: false,
   transparent: true,
-  // let Chromium to accept any size changes from OS
-  resizable: !isLinux,
+  resizable: true,
   // disable shadow for Mac OS
   hasShadow: !isMac,
   // float above all windows on Mac OS
@@ -168,16 +167,15 @@ class OverlayControllerGlobal {
     if (process.platform === 'win32') {
       lastBounds = screen.screenToDipRect(this.electronWindow, this.targetBounds)
     } else if (isLinux) {
-      // The `xcb_get_geometry` can receive physical coords under KDE's XWayland.
-      // see https://github.com/SnosMe/electron-overlay-window/pull/50
-      // The following code should be a no-op on native X11.
-
-      const tl = screen.screenToDipPoint({ x: lastBounds.x, y: lastBounds.y })
-      // const br = screen.screenToDipPoint({ x: lastBounds.x + lastBounds.width, y: lastBounds.y + lastBounds.height })
-      // lastBounds = { x: tl.x, y: tl.y, width: br.x - tl.x, height: br.y - tl.y }
-
-      const logicalSize = screen.screenToDipPoint({ x: lastBounds.width, y: lastBounds.height })
-      lastBounds = { x: tl.x, y: tl.y, width: logicalSize.x, height: logicalSize.y }
+      // XWayland reports physical pixels; convert to DIP (logical) for Electron
+      const display = screen.getDisplayNearestPoint({ x: lastBounds.x, y: lastBounds.y })
+      const scaleFactor = display.scaleFactor || 1
+      lastBounds = {
+        x: Math.round(lastBounds.x / scaleFactor),
+        y: Math.round(lastBounds.y / scaleFactor),
+        width: Math.round(lastBounds.width / scaleFactor),
+        height: Math.round(lastBounds.height / scaleFactor)
+      }
     }
     this.electronWindow.setBounds(lastBounds)
 
@@ -190,25 +188,29 @@ class OverlayControllerGlobal {
   }
 
   private handler (e: unknown) {
-    switch ((e as { type: EventType }).type) {
-      case EventType.EVENT_ATTACH:
-        this.events.emit('attach', e)
-        break
-      case EventType.EVENT_FOCUS:
-        this.events.emit('focus', e)
-        break
-      case EventType.EVENT_BLUR:
-        this.events.emit('blur', e)
-        break
-      case EventType.EVENT_DETACH:
-        this.events.emit('detach', e)
-        break
-      case EventType.EVENT_FULLSCREEN:
-        this.events.emit('fullscreen', e)
-        break
-      case EventType.EVENT_MOVERESIZE:
-        this.events.emit('moveresize', e)
-        break
+    try {
+      switch ((e as { type: EventType }).type) {
+        case EventType.EVENT_ATTACH:
+          this.events.emit('attach', e)
+          break
+        case EventType.EVENT_FOCUS:
+          this.events.emit('focus', e)
+          break
+        case EventType.EVENT_BLUR:
+          this.events.emit('blur', e)
+          break
+        case EventType.EVENT_DETACH:
+          this.events.emit('detach', e)
+          break
+        case EventType.EVENT_FULLSCREEN:
+          this.events.emit('fullscreen', e)
+          break
+        case EventType.EVENT_MOVERESIZE:
+          this.events.emit('moveresize', e)
+          break
+      }
+    } catch (err) {
+      console.error('[electron-overlay-window] handler error:', err)
     }
   }
 
