@@ -18,14 +18,23 @@ var EventType;
 })(EventType || (EventType = {}));
 const isMac = process.platform === 'darwin';
 const isLinux = process.platform === 'linux';
+function screenToDipRect(rect) {
+    const tl = electron_1.screen.screenToDipPoint({ x: rect.x, y: rect.y });
+    const br = electron_1.screen.screenToDipPoint({ x: rect.x + rect.width, y: rect.y + rect.height });
+    return {
+        x: Math.round(tl.x),
+        y: Math.round(tl.y),
+        width: Math.round(br.x - tl.x),
+        height: Math.round(br.y - tl.y)
+    };
+}
 exports.OVERLAY_WINDOW_OPTS = {
     fullscreenable: true,
-    skipTaskbar: !isLinux,
+    skipTaskbar: true,
     frame: false,
     show: false,
     transparent: true,
-    // let Chromium to accept any size changes from OS
-    resizable: !isLinux,
+    resizable: true,
     // disable shadow for Mac OS
     hasShadow: !isMac,
     // float above all windows on Mac OS
@@ -115,14 +124,19 @@ class OverlayControllerGlobal {
             lastBounds = electron_1.screen.screenToDipRect(this.electronWindow, this.targetBounds);
         }
         else if (isLinux) {
-            // The `xcb_get_geometry` can receive physical coords under KDE's XWayland.
-            // see https://github.com/SnosMe/electron-overlay-window/pull/50
-            // The following code should be a no-op on native X11.
-            const tl = electron_1.screen.screenToDipPoint({ x: lastBounds.x, y: lastBounds.y });
-            // const br = screen.screenToDipPoint({ x: lastBounds.x + lastBounds.width, y: lastBounds.y + lastBounds.height })
-            // lastBounds = { x: tl.x, y: tl.y, width: br.x - tl.x, height: br.y - tl.y }
-            const logicalSize = electron_1.screen.screenToDipPoint({ x: lastBounds.width, y: lastBounds.height });
-            lastBounds = { x: tl.x, y: tl.y, width: logicalSize.x, height: logicalSize.y };
+            // XWayland reports root coordinates in its own scaled screen space. Map
+            // the rect by converting both corners to DIP; dividing the absolute origin
+            // by a scale factor breaks on secondary monitors.
+            //lastBounds = screenToDipRect(lastBounds)
+            // XWayland reports physical pixels; convert to DIP (logical) for Electron
+            const display = electron_1.screen.getDisplayNearestPoint({ x: lastBounds.x, y: lastBounds.y });
+            const scaleFactor = display.scaleFactor || 1;
+            lastBounds = {
+                x: Math.round(lastBounds.x / scaleFactor),
+                y: Math.round(lastBounds.y / scaleFactor),
+                width: Math.round(lastBounds.width / scaleFactor),
+                height: Math.round(lastBounds.height / scaleFactor)
+            };
         }
         this.electronWindow.setBounds(lastBounds);
         // if moved to screen with different DPI, 2nd call to setBounds will correctly resize window
@@ -133,25 +147,30 @@ class OverlayControllerGlobal {
         }
     }
     handler(e) {
-        switch (e.type) {
-            case EventType.EVENT_ATTACH:
-                this.events.emit('attach', e);
-                break;
-            case EventType.EVENT_FOCUS:
-                this.events.emit('focus', e);
-                break;
-            case EventType.EVENT_BLUR:
-                this.events.emit('blur', e);
-                break;
-            case EventType.EVENT_DETACH:
-                this.events.emit('detach', e);
-                break;
-            case EventType.EVENT_FULLSCREEN:
-                this.events.emit('fullscreen', e);
-                break;
-            case EventType.EVENT_MOVERESIZE:
-                this.events.emit('moveresize', e);
-                break;
+        try {
+            switch (e.type) {
+                case EventType.EVENT_ATTACH:
+                    this.events.emit('attach', e);
+                    break;
+                case EventType.EVENT_FOCUS:
+                    this.events.emit('focus', e);
+                    break;
+                case EventType.EVENT_BLUR:
+                    this.events.emit('blur', e);
+                    break;
+                case EventType.EVENT_DETACH:
+                    this.events.emit('detach', e);
+                    break;
+                case EventType.EVENT_FULLSCREEN:
+                    this.events.emit('fullscreen', e);
+                    break;
+                case EventType.EVENT_MOVERESIZE:
+                    this.events.emit('moveresize', e);
+                    break;
+            }
+        }
+        catch (err) {
+            console.error('[electron-overlay-window] handler error:', err);
         }
     }
     /**
