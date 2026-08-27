@@ -45,6 +45,25 @@ static struct ow_overlay_window overlay_info = {
   .window_id = XCB_WINDOW_NONE
 };
 
+static void update_overlay_bounds(const struct ow_window_bounds* bounds) {
+  if (overlay_info.window_id == XCB_WINDOW_NONE) {
+    return;
+  }
+
+  const uint16_t mask =
+    XCB_CONFIG_WINDOW_X |
+    XCB_CONFIG_WINDOW_Y |
+    XCB_CONFIG_WINDOW_WIDTH |
+    XCB_CONFIG_WINDOW_HEIGHT;
+  const uint32_t values[] = {
+    (uint32_t)bounds->x,
+    (uint32_t)bounds->y,
+    bounds->width,
+    bounds->height
+  };
+  xcb_configure_window(x_conn, overlay_info.window_id, mask, values);
+}
+
 static xcb_window_t get_active_window() {
   xcb_get_property_reply_t* prop_reply = xcb_get_property_reply(x_conn, xcb_get_property(x_conn, 0, root, ATOM_NET_ACTIVE_WINDOW, XCB_ATOM_WINDOW, 0, 1), NULL);
   if (prop_reply == NULL) {
@@ -213,6 +232,9 @@ static void check_and_handle_window(xcb_window_t wid, struct ow_target_window* t
     is_fullscreen_window(target_info->window_id, &is_fullscreen) &&
     get_content_bounds(target_info->window_id, &e.data.attach.bounds)
   ) {
+    // Configure the hidden window before Electron maps it. Some compositors
+    // otherwise keep the BrowserWindow's default 800x600 input region.
+    update_overlay_bounds(&e.data.attach.bounds);
     if (is_fullscreen != target_info->is_fullscreen) {
       target_info->is_fullscreen = is_fullscreen;
       e.data.attach.is_fullscreen = is_fullscreen;
