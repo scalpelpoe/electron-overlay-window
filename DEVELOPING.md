@@ -61,3 +61,12 @@ Immediately on attaching to a window, a background thread executes
   - Cleans up any existing hooks before this
 - Attaches the target's input handling to the overlay's input handling
 - Emit attach and focus events
+
+## Linux shutdown regression test
+
+Run `npm run test:linux-shutdown` with a C compiler, XCB and libuv development
+libraries, and `DISPLAY` pointing to X11/XWayland or Xvfb. The test builds the
+native tracker with AddressSanitizer and UndefinedBehaviorSanitizer and checks
+immediate shutdown, idle and busy event queues, repeated cleanup, and a failed
+X connection. In a headless environment, use
+`xvfb-run -a npm run test:linux-shutdown`.

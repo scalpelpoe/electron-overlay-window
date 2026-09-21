@@ -21,6 +21,7 @@
   "types": "dist/index.d.ts",
   "scripts": {
     "install": "node-gyp-build",
+    "test:linux-shutdown": "node scripts/test-linux-shutdown.mjs",
     "prebuild": "prebuildify --napi",
     "demo:electron": "node-gyp rebuild && npx tsc && electron dist/demo/electron-demo.js"
   },
