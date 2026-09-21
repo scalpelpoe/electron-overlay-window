@@ -24,8 +24,9 @@ jobs:
     - uses: actions/setup-node@v6
     - run: |
         sudo apt-get update
-        sudo apt-get install -y libxcb1-dev
+        sudo apt-get install -y libxcb1-dev libuv1-dev xvfb
     - run: npm ci
+    - run: xvfb-run -a npm run test:linux-shutdown
     - run: npm run prebuild
     - uses: actions/upload-artifact@v7
       with:
