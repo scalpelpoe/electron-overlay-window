@@ -1,0 +1,90 @@
+# Wayland layer-shell host
+
+`overlay-wayland-host` presents Electron overlay windows as
+`zwlr_layer_shell_v1` surfaces on any compositor that implements layer-shell
+(wlroots-based compositors, Hyprland, niri, KWin, COSMIC, ...). GNOME does not.
+
+Chromium only creates `xdg_toplevel` windows, which compositors may tile, move
+behind a fullscreen game, or refuse to position. Electron also links its own
+copy of libwayland-client into the executable and exports its symbols, so
+Wayland code inside the Node addon would be bound to that copy. The host is
+therefore a separate process with its own Wayland connection:
+
+- Electron renders overlay windows offscreen (`webPreferences.offscreen`).
+- `src/wayland/` copies each painted frame into a shared memory file and
+  forwards pointer and keyboard events back into the page with
+  `webContents.sendInputEvent`.
+- The host tracks toplevels (`zwlr_foreign_toplevel_manager_v1`) to find the
+  target window, and mirrors the clipboard (`ext_data_control_v1` or
+  `zwlr_data_control_v1`) so Electron can read and write it without focus.
+
+`protocols/` holds the protocol XML, copied unchanged from wayland-protocols
+and wlr-protocols. The build generates the C glue from it with
+`wayland-scanner`, so the host needs `wayland-scanner` in addition to the
+`wayland-client`, `wayland-cursor` and `xkbcommon` development files.
+
+## Wire protocol
+
+The host reads commands from stdin and writes events to stdout, one per line.
+stdin EOF terminates the host. Diagnostics go to stderr.
+
+`overlay-wayland-host --probe` prints the `ready` event and exits with status 0
+when layer-shell is available, 1 when it is not, and 2 when no Wayland
+compositor could be reached.
+
+### Coordinates
+
+- Surface geometry uses global logical coordinates, the space of
+  `zxdg_output_v1` logical positions. Electron's `screen` uses the same space
+  under `--ozone-platform=wayland`.
+- Pointer positions and input regions are surface-local logical coordinates.
+- Buffers and damage are in buffer pixels. The host sets the
+  `wp_viewport` destination to the logical size, so a buffer rendered at the
+  output scale is shown sharp.
+
+### Commands
+
+Fields are separated by one space. `<sid>` is a surface id chosen by the
+client, `<tid>` a toplevel id chosen by the host. Text payloads are base64.
+
+| Command | Meaning |
+| --- | --- |
+| `create <sid>` | Register a surface. It starts hidden. |
+| `destroy <sid>` | Unmap and forget a surface and its buffers. |
+| `geometry <sid> <x> <y> <w> <h>` | Logical rectangle. A visible surface moves to the output containing the rectangle's center, recreating its layer surface if that output changed. |
+| `keyboard <sid> none\|on_demand\|exclusive` | Keyboard interactivity. Below layer-shell v4, `on_demand` maps to `none`. |
+| `input <sid> all` | Whole surface accepts pointer input. |
+| `input <sid> none` | Surface is click-through. |
+| `input <sid> <x>,<y>,<w>,<h> ...` | Only these rectangles accept pointer input. |
+| `layer <sid> background\|bottom\|top\|overlay` | Layer of the surface, `overlay` by default. Applied with `set_layer` from layer-shell v2, else by recreating a visible surface. |
+| `show <sid>` | Create the layer surface on the current layer and map the last committed buffer after the first configure. |
+| `hide <sid>` | Destroy the layer surface and `wl_surface`. Busy buffers are reported released. |
+| `raise <sid>` | Recreate a visible surface so it stacks above the other layer surfaces. |
+| `buffers <sid> <path> <w> <h>` | Replace the buffer pool. The file holds two ARGB8888 premultiplied buffers of `w*h*4` bytes with stride `w*4`; buffer `i` starts at `i*w*h*4`. |
+| `commit <sid> <index> <x> <y> <w> <h>` | Present buffer `index` with this damage rectangle. Before the first configure or while hidden it is stored and presented once mapped. |
+| `cursor <sid> <name>` | CSS cursor name, as reported by Electron's `cursor-changed` event. `none` hides the cursor. |
+| `activate <tid>` | Activate a toplevel with the host's seat. |
+| `clipboard-set <text> <html\|->` | Own the selection with text, and optionally HTML. |
+| `clipboard-clear` | Clear the selection. |
+
+### Events
+
+JSON objects with an `ev` field.
+
+| Event | Fields |
+| --- | --- |
+| `ready` | `layerShell`, `layerShellVersion`, `foreignToplevel`, `dataControl`, `cursorShape`, `viewporter`: availability of each global. Sent once after the initial roundtrips. |
+| `outputs` | `outputs`: array of `{ name, description, x, y, width, height, scale }` in logical coordinates. Sent after `ready` and whenever an output changes. |
+| `configure` | `sid`, `width`, `height`: the size the compositor assigned. `attached`: index of the buffer the host presented again on a newly created layer surface, now busy until released, or -1. |
+| `closed` | `sid`: the compositor closed the layer surface, for example because its output disappeared. The surface is hidden. |
+| `buffers` | `sid`, `path`: the pool was created and the file may be unlinked. |
+| `release` | `sid`, `index`: the buffer of the current pool may be written again. Buffers of a replaced pool are never reported. |
+| `pointer` | `sid`, `type` (`enter`, `leave`, `motion`), `x`, `y`. |
+| `button` | `sid`, `button` (`left`, `right`, `middle`, `back`, `forward`), `pressed`, `x`, `y`. |
+| `axis` | `sid`, `x`, `y`, `dx`, `dy`, `discreteX`, `discreteY`. Sent on `wl_pointer.frame`. Deltas are in surface units, positive meaning down and right; discrete steps are wheel clicks (`value120 / 120`), 0 for continuous scrolling. |
+| `focus` | `sid`, `focused`: keyboard focus entered or left. |
+| `key` | `sid`, `pressed`, `repeat`, `keysym` (xkb keysym name), `sym` (its numeric value), `text` (UTF-8 produced by the key, empty for none), `mods` (`{ shift, ctrl, alt, meta, caps, num }`). Repeats are generated by the host from `wl_keyboard.repeat_info`. |
+| `toplevel` | `tid`, `title`, `appId`, `activated`, `fullscreen`, `maximized`, `minimized`, `outputs` (output names). Sent on every `done`. |
+| `toplevel-closed` | `tid` |
+| `clipboard` | `text`, `html`: the new selection, `null` when it has no such content or was cleared. |
+| `error` | `message`. Fatal errors are followed by exit. |
