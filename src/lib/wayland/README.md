@@ -57,11 +57,11 @@ client, `<tid>` a toplevel id chosen by the host. Text payloads are base64.
 | `input <sid> none` | Surface is click-through. |
 | `input <sid> <x>,<y>,<w>,<h> ...` | Only these rectangles accept pointer input. |
 | `layer <sid> background\|bottom\|top\|overlay` | Layer of the surface, `overlay` by default. Applied with `set_layer` from layer-shell v2, else by recreating a visible surface. |
-| `show <sid>` | Create the layer surface on the current layer and map the last committed buffer after the first configure. |
-| `hide <sid>` | Destroy the layer surface and `wl_surface`. Busy buffers are reported released. |
+| `show <sid>` | Create the layer surface on the current layer. A buffer committed before the first configure is presented then; otherwise the surface stays empty until the next commit. |
+| `hide <sid>` | Destroy the layer surface and `wl_surface`. Attached buffers stay busy until the compositor releases them. |
 | `raise <sid>` | Recreate a visible surface so it stacks above the other layer surfaces. |
-| `buffers <sid> <path> <w> <h>` | Replace the buffer pool. The file holds two ARGB8888 premultiplied buffers of `w*h*4` bytes with stride `w*4`; buffer `i` starts at `i*w*h*4`. |
-| `commit <sid> <index> <x> <y> <w> <h>` | Present buffer `index` with this damage rectangle. Before the first configure or while hidden it is stored and presented once mapped. |
+| `buffers <sid> <pool> <path> <w> <h>` | Replace the buffer pool with pool id `pool`. The file holds two ARGB8888 premultiplied buffers of `w*h*4` bytes with stride `w*4`; buffer `i` starts at `i*w*h*4`. |
+| `commit <sid> <pool> <index> <x> <y> <w> <h>` | Present buffer `index` of pool `pool` with this damage rectangle. Before the first configure it is held and presented then; a newer commit replaces it and releases the held buffer. A commit to a pool that is not current is released immediately. |
 | `cursor <sid> <name>` | CSS cursor name, as reported by Electron's `cursor-changed` event. `none` hides the cursor. |
 | `activate <tid>` | Activate a toplevel with the host's seat. |
 | `clipboard-set <text> <html\|->` | Own the selection with text, and optionally HTML. |
@@ -75,10 +75,10 @@ JSON objects with an `ev` field.
 | --- | --- |
 | `ready` | `layerShell`, `layerShellVersion`, `foreignToplevel`, `dataControl`, `cursorShape`, `viewporter`: availability of each global. Sent once after the initial roundtrips. |
 | `outputs` | `outputs`: array of `{ name, description, x, y, width, height, scale }` in logical coordinates. Sent after `ready` and whenever an output changes. |
-| `configure` | `sid`, `width`, `height`: the size the compositor assigned. `attached`: index of the buffer the host presented again on a newly created layer surface, now busy until released, or -1. |
+| `configure` | `sid`, `width`, `height`: the size the compositor assigned. Sent for every new layer surface, which starts empty unless a buffer was held for it, and when the size changes. |
 | `closed` | `sid`: the compositor closed the layer surface, for example because its output disappeared. The surface is hidden. |
-| `buffers` | `sid`, `path`: the pool was created and the file may be unlinked. |
-| `release` | `sid`, `index`: the buffer of the current pool may be written again. Buffers of a replaced pool are never reported. |
+| `buffers` | `sid`, `pool`, `path`: the pool was created and the file may be unlinked. |
+| `release` | `sid`, `pool`, `index`: the buffer may be written again. Sent when the compositor releases an attached buffer, or when the host returns one it never attached. |
 | `pointer` | `sid`, `type` (`enter`, `leave`, `motion`), `x`, `y`. |
 | `button` | `sid`, `button` (`left`, `right`, `middle`, `back`, `forward`), `pressed`, `x`, `y`. |
 | `axis` | `sid`, `x`, `y`, `dx`, `dy`, `discreteX`, `discreteY`. Sent on `wl_pointer.frame`. Deltas are in surface units, positive meaning down and right; discrete steps are wheel clicks (`value120 / 120`), 0 for continuous scrolling. |

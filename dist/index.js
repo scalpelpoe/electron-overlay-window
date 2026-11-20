@@ -1,12 +1,25 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.OverlayController = exports.OVERLAY_WINDOW_OPTS = void 0;
+exports.OverlayController = exports.waylandClipboard = exports.LAYER_SHELL_WEB_PREFERENCES = exports.OVERLAY_WINDOW_OPTS = exports.setLayerShortcutHandler = exports.releaseLayerKeyboards = exports.getLayerPointer = exports.getLayerWindow = exports.adoptLayerWindow = exports.probeWaylandHost = exports.layerShellUsable = void 0;
 const node_events_1 = require("node:events");
 const node_path_1 = require("node:path");
 const throttle_debounce_1 = require("throttle-debounce");
 const electron_1 = require("electron");
 const electron_2 = require("electron");
+const host_1 = require("./wayland/host");
+const layer_window_1 = require("./wayland/layer-window");
+const tracker_1 = require("./wayland/tracker");
 const lib = require('node-gyp-build')((0, node_path_1.join)(__dirname, '..'));
+var host_2 = require("./wayland/host");
+Object.defineProperty(exports, "layerShellUsable", { enumerable: true, get: function () { return host_2.layerShellUsable; } });
+Object.defineProperty(exports, "probeWaylandHost", { enumerable: true, get: function () { return host_2.probeWaylandHost; } });
+var layer_window_2 = require("./wayland/layer-window");
+Object.defineProperty(exports, "adoptLayerWindow", { enumerable: true, get: function () { return layer_window_2.adoptLayerWindow; } });
+Object.defineProperty(exports, "getLayerWindow", { enumerable: true, get: function () { return layer_window_2.getLayerWindow; } });
+Object.defineProperty(exports, "getLayerPointer", { enumerable: true, get: function () { return layer_window_2.getLayerPointer; } });
+Object.defineProperty(exports, "releaseLayerKeyboards", { enumerable: true, get: function () { return layer_window_2.releaseLayerKeyboards; } });
+var layer_window_3 = require("./wayland/layer-window");
+Object.defineProperty(exports, "setLayerShortcutHandler", { enumerable: true, get: function () { return layer_window_3.setLayerShortcutHandler; } });
 var EventType;
 (function (EventType) {
     EventType[EventType["EVENT_ATTACH"] = 1] = "EVENT_ATTACH";
@@ -18,16 +31,6 @@ var EventType;
 })(EventType || (EventType = {}));
 const isMac = process.platform === 'darwin';
 const isLinux = process.platform === 'linux';
-function screenToDipRect(rect) {
-    const tl = electron_1.screen.screenToDipPoint({ x: rect.x, y: rect.y });
-    const br = electron_1.screen.screenToDipPoint({ x: rect.x + rect.width, y: rect.y + rect.height });
-    return {
-        x: Math.round(tl.x),
-        y: Math.round(tl.y),
-        width: Math.round(br.x - tl.x),
-        height: Math.round(br.y - tl.y)
-    };
-}
 exports.OVERLAY_WINDOW_OPTS = {
     fullscreenable: true,
     skipTaskbar: true,
@@ -40,6 +43,36 @@ exports.OVERLAY_WINDOW_OPTS = {
     // float above all windows on Mac OS
     alwaysOnTop: isMac
 };
+/** Web preferences a window needs before `adoptLayerWindow` can present it
+ *  as a layer-shell surface. Merge into the window's own webPreferences. */
+exports.LAYER_SHELL_WEB_PREFERENCES = {
+    offscreen: true,
+    // Hidden offscreen windows would otherwise throttle timers and rAF.
+    backgroundThrottling: false
+};
+/** Clipboard through the Wayland host's data-control connection. Chromium
+ *  only sees the Wayland clipboard while one of its own windows is focused,
+ *  which an overlay over a game never is. */
+exports.waylandClipboard = {
+    available() {
+        return !!host_1.WaylandHost.get()?.features?.dataControl;
+    },
+    readText() {
+        return host_1.WaylandHost.get()?.clipboardText ?? '';
+    },
+    readHTML() {
+        return host_1.WaylandHost.get()?.clipboardHtml ?? '';
+    },
+    writeText(text) {
+        host_1.WaylandHost.get()?.writeClipboard(text);
+    },
+    write(data) {
+        host_1.WaylandHost.get()?.writeClipboard(data.text ?? '', data.html);
+    },
+    clear() {
+        host_1.WaylandHost.get()?.clearClipboard();
+    }
+};
 class OverlayControllerGlobal {
     constructor() {
         this.isInitialized = false;
@@ -50,6 +83,11 @@ class OverlayControllerGlobal {
         // The height of a title bar on a standard window. Only measured on Mac
         this.macTitleBarHeight = 0;
         this.attachOptions = {};
+        this.layerShell = false;
+        this.tracker = null;
+        this.x11Arbiter = null;
+        // Target titles until the layer-shell tracker starts.
+        this.layerTitles = [];
         this.events = new node_events_1.EventEmitter();
         this.events.on('attach', (e) => {
             this.targetHasFocus = true;
@@ -120,14 +158,13 @@ class OverlayControllerGlobal {
             return;
         if (!this.electronWindow)
             return;
-        if (process.platform === 'win32') {
+        if (this.layerShell) {
+            // Layer-shell targets are tracked in logical coordinates already.
+        }
+        else if (process.platform === 'win32') {
             lastBounds = electron_1.screen.screenToDipRect(this.electronWindow, this.targetBounds);
         }
         else if (isLinux) {
-            // XWayland reports root coordinates in its own scaled screen space. Map
-            // the rect by converting both corners to DIP; dividing the absolute origin
-            // by a scale factor breaks on secondary monitors.
-            //lastBounds = screenToDipRect(lastBounds)
             // XWayland reports physical pixels; convert to DIP (logical) for Electron
             const display = electron_1.screen.getDisplayNearestPoint({ x: lastBounds.x, y: lastBounds.y });
             const scaleFactor = display.scaleFactor || 1;
@@ -147,6 +184,10 @@ class OverlayControllerGlobal {
         }
     }
     handler(e) {
+        if (this.x11Arbiter) {
+            this.arbitrateX11Event(e, this.x11Arbiter);
+            return;
+        }
         try {
             switch (e.type) {
                 case EventType.EVENT_ATTACH:
@@ -172,6 +213,60 @@ class OverlayControllerGlobal {
         catch (err) {
             console.error('[electron-overlay-window] handler error:', err);
         }
+    }
+    /** X11 target tracking while the overlay is a layer surface: keyboard focus
+     *  in the overlay deactivates the X11 target, which must not hide it. */
+    arbitrateX11Event(e, arbiter) {
+        const logical = (event) => ({ ...event, ...(0, tracker_1.x11BoundsToLogical)(event, host_1.WaylandHost.get()?.outputs ?? []) });
+        switch (e.type) {
+            case EventType.EVENT_ATTACH:
+                arbiter.reset(false);
+                this.events.emit('attach', logical(e));
+                break;
+            case EventType.EVENT_DETACH:
+                arbiter.reset(false);
+                this.events.emit('detach', e);
+                break;
+            case EventType.EVENT_FOCUS:
+                arbiter.setGameFocused(true);
+                break;
+            case EventType.EVENT_BLUR:
+                arbiter.setGameFocused(false);
+                break;
+            case EventType.EVENT_FULLSCREEN:
+                this.events.emit('fullscreen', e);
+                break;
+            case EventType.EVENT_MOVERESIZE:
+                this.events.emit('moveresize', logical(e));
+                break;
+        }
+    }
+    emitTrackerEvent(event) {
+        const { type, ...payload } = event;
+        try {
+            this.events.emit(type, payload);
+        }
+        catch (err) {
+            console.error('[electron-overlay-window] handler error:', err);
+        }
+    }
+    /**
+     * Presents overlays as wlr-layer-shell surfaces through the Wayland host
+     * (see src/lib/wayland/README.md). For Electron running with
+     * `--ozone-platform=wayland`; call before `attachByTitle`. Overlay windows
+     * must be created with `LAYER_SHELL_WEB_PREFERENCES`. Returns false when the
+     * compositor lacks layer-shell v4 or the host is not installed.
+     */
+    useLayerShell() {
+        if (this.isInitialized)
+            throw new Error('Call useLayerShell before attaching.');
+        if (!isLinux || !(0, host_1.layerShellUsable)((0, host_1.probeWaylandHost)()))
+            return false;
+        this.layerShell = host_1.WaylandHost.start() !== null;
+        return this.layerShell;
+    }
+    get isLayerShell() {
+        return this.layerShell;
     }
     /**
      * Create a dummy window to calculate the title bar height on Mac. We use
@@ -210,7 +305,10 @@ class OverlayControllerGlobal {
         }
         this.focusNext = 'overlay';
         this.electronWindow.setIgnoreMouseEvents(false);
-        if (isLinux) {
+        if (this.layerShell) {
+            this.electronWindow.focus();
+        }
+        else if (isLinux) {
             lib.activateOverlay();
         }
         else {
@@ -220,6 +318,11 @@ class OverlayControllerGlobal {
     focusTarget() {
         this.focusNext = 'target';
         this.electronWindow?.setIgnoreMouseEvents(true);
+        if (this.layerShell) {
+            (0, layer_window_1.releaseLayerKeyboards)();
+            this.tracker?.focusTarget();
+            return;
+        }
         lib.focusTarget();
     }
     attachByTitle(electronWindow, targetWindowTitle, options = {}) {
@@ -245,15 +348,60 @@ class OverlayControllerGlobal {
         if (isMac) {
             this.calculateMacTitleBarHeight();
         }
+        if (this.layerShell) {
+            this.attachLayerShell(targetWindowTitles);
+            return;
+        }
         lib.start(this.electronWindow?.getNativeWindowHandle(), targetWindowTitles, this.handler.bind(this));
     }
+    attachLayerShell(titles) {
+        const host = host_1.WaylandHost.get();
+        if (this.electronWindow)
+            (0, layer_window_1.adoptLayerWindow)(this.electronWindow);
+        this.layerTitles = titles;
+        void host.ready().then(() => {
+            titles = this.layerTitles;
+            if (!host.features) {
+                console.error('[electron-overlay-window] the Wayland host did not start; the target is not tracked');
+                return;
+            }
+            if (host.features.foreignToplevel) {
+                this.tracker = new tracker_1.ToplevelTracker(host, titles, (event) => this.emitTrackerEvent(event));
+                return;
+            }
+            // KWin and others without foreign-toplevel management: follow an
+            // XWayland target through the X11 backend in tracking-only mode.
+            this.x11Arbiter = new tracker_1.FocusArbiter((event) => this.emitTrackerEvent(event));
+            lib.start(undefined, titles, this.handler.bind(this));
+        });
+    }
+    /** Whether the layer-shell backend has not chosen its tracker yet. */
+    get layerTrackerPending() {
+        return this.layerShell && !this.tracker && !this.x11Arbiter;
+    }
     setTargetTitles(titles) {
-        lib.setTargetTitles(titles);
+        if (this.layerTrackerPending)
+            this.layerTitles = titles;
+        else if (this.tracker)
+            this.tracker.setTitles(titles);
+        else
+            lib.setTargetTitles(titles);
     }
     clearTarget() {
-        lib.clearTarget();
+        if (this.layerTrackerPending)
+            this.layerTitles = [];
+        else if (this.tracker)
+            this.tracker.clear();
+        else
+            lib.clearTarget();
     }
     stopHook() {
+        if (this.tracker) {
+            this.tracker.stop();
+            this.tracker = null;
+            return;
+        }
+        this.x11Arbiter?.stop();
         lib.stopHook();
     }
     // buffer suitable for use in `nativeImage.createFromBitmap`

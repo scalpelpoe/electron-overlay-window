@@ -2,8 +2,22 @@ import { EventEmitter } from 'node:events'
 import { join } from 'node:path'
 import { throttle } from 'throttle-debounce'
 import { screen } from 'electron'
-import { BrowserWindow, Rectangle, BrowserWindowConstructorOptions } from 'electron'
+import { BrowserWindow, Rectangle, BrowserWindowConstructorOptions, WebPreferences } from 'electron'
+import { layerShellUsable, probeWaylandHost, WaylandHost } from './wayland/host'
+import { adoptLayerWindow, releaseLayerKeyboards } from './wayland/layer-window'
+import { FocusArbiter, ToplevelTracker, type TrackerEvent, x11BoundsToLogical } from './wayland/tracker'
 const lib: AddonExports = require('node-gyp-build')(join(__dirname, '..'))
+
+export { layerShellUsable, probeWaylandHost, type HostFeatures, type WaylandOutput } from './wayland/host'
+export {
+  adoptLayerWindow,
+  getLayerWindow,
+  getLayerPointer,
+  releaseLayerKeyboards,
+  type LayerWindow,
+  type LayerWindowOptions
+} from './wayland/layer-window'
+export { setLayerShortcutHandler } from './wayland/layer-window'
 
 interface AddonExports {
   start(
@@ -71,6 +85,38 @@ export const OVERLAY_WINDOW_OPTS: BrowserWindowConstructorOptions = {
   alwaysOnTop: isMac
 }
 
+/** Web preferences a window needs before `adoptLayerWindow` can present it
+ *  as a layer-shell surface. Merge into the window's own webPreferences. */
+export const LAYER_SHELL_WEB_PREFERENCES: WebPreferences = {
+  offscreen: true,
+  // Hidden offscreen windows would otherwise throttle timers and rAF.
+  backgroundThrottling: false
+}
+
+/** Clipboard through the Wayland host's data-control connection. Chromium
+ *  only sees the Wayland clipboard while one of its own windows is focused,
+ *  which an overlay over a game never is. */
+export const waylandClipboard = {
+  available (): boolean {
+    return !!WaylandHost.get()?.features?.dataControl
+  },
+  readText (): string {
+    return WaylandHost.get()?.clipboardText ?? ''
+  },
+  readHTML (): string {
+    return WaylandHost.get()?.clipboardHtml ?? ''
+  },
+  writeText (text: string): void {
+    WaylandHost.get()?.writeClipboard(text)
+  },
+  write (data: { text?: string; html?: string }): void {
+    WaylandHost.get()?.writeClipboard(data.text ?? '', data.html)
+  },
+  clear (): void {
+    WaylandHost.get()?.clearClipboard()
+  }
+}
+
 class OverlayControllerGlobal {
   private isInitialized = false
   private electronWindow?: BrowserWindow
@@ -82,6 +128,11 @@ class OverlayControllerGlobal {
   // The height of a title bar on a standard window. Only measured on Mac
   private macTitleBarHeight = 0
   private attachOptions: AttachOptions = {}
+  private layerShell = false
+  private tracker: ToplevelTracker | null = null
+  private x11Arbiter: FocusArbiter | null = null
+  // Target titles until the layer-shell tracker starts.
+  private layerTitles: string[] = []
 
   readonly events = new EventEmitter()
 
@@ -164,7 +215,9 @@ class OverlayControllerGlobal {
     if (lastBounds.width === 0 || lastBounds.height === 0) return
     if (!this.electronWindow) return
 
-    if (process.platform === 'win32') {
+    if (this.layerShell) {
+      // Layer-shell targets are tracked in logical coordinates already.
+    } else if (process.platform === 'win32') {
       lastBounds = screen.screenToDipRect(this.electronWindow, this.targetBounds)
     } else if (isLinux) {
       // XWayland reports physical pixels; convert to DIP (logical) for Electron
@@ -188,6 +241,10 @@ class OverlayControllerGlobal {
   }
 
   private handler (e: unknown) {
+    if (this.x11Arbiter) {
+      this.arbitrateX11Event(e as { type: EventType }, this.x11Arbiter)
+      return
+    }
     try {
       switch ((e as { type: EventType }).type) {
         case EventType.EVENT_ATTACH:
@@ -212,6 +269,62 @@ class OverlayControllerGlobal {
     } catch (err) {
       console.error('[electron-overlay-window] handler error:', err)
     }
+  }
+
+  /** X11 target tracking while the overlay is a layer surface: keyboard focus
+   *  in the overlay deactivates the X11 target, which must not hide it. */
+  private arbitrateX11Event (e: { type: EventType }, arbiter: FocusArbiter) {
+    const logical = <T extends Rectangle>(event: T): T =>
+      ({ ...event, ...x11BoundsToLogical(event, WaylandHost.get()?.outputs ?? []) })
+    switch (e.type) {
+      case EventType.EVENT_ATTACH:
+        arbiter.reset(false)
+        this.events.emit('attach', logical(e as AttachEvent & { type: EventType }))
+        break
+      case EventType.EVENT_DETACH:
+        arbiter.reset(false)
+        this.events.emit('detach', e)
+        break
+      case EventType.EVENT_FOCUS:
+        arbiter.setGameFocused(true)
+        break
+      case EventType.EVENT_BLUR:
+        arbiter.setGameFocused(false)
+        break
+      case EventType.EVENT_FULLSCREEN:
+        this.events.emit('fullscreen', e)
+        break
+      case EventType.EVENT_MOVERESIZE:
+        this.events.emit('moveresize', logical(e as MoveresizeEvent & { type: EventType }))
+        break
+    }
+  }
+
+  private emitTrackerEvent (event: TrackerEvent) {
+    const { type, ...payload } = event
+    try {
+      this.events.emit(type, payload)
+    } catch (err) {
+      console.error('[electron-overlay-window] handler error:', err)
+    }
+  }
+
+  /**
+   * Presents overlays as wlr-layer-shell surfaces through the Wayland host
+   * (see src/lib/wayland/README.md). For Electron running with
+   * `--ozone-platform=wayland`; call before `attachByTitle`. Overlay windows
+   * must be created with `LAYER_SHELL_WEB_PREFERENCES`. Returns false when the
+   * compositor lacks layer-shell v4 or the host is not installed.
+   */
+  useLayerShell (): boolean {
+    if (this.isInitialized) throw new Error('Call useLayerShell before attaching.')
+    if (!isLinux || !layerShellUsable(probeWaylandHost())) return false
+    this.layerShell = WaylandHost.start() !== null
+    return this.layerShell
+  }
+
+  get isLayerShell (): boolean {
+    return this.layerShell
   }
 
   /**
@@ -254,7 +367,9 @@ class OverlayControllerGlobal {
     }
     this.focusNext = 'overlay'
     this.electronWindow.setIgnoreMouseEvents(false)
-    if (isLinux) {
+    if (this.layerShell) {
+      this.electronWindow.focus()
+    } else if (isLinux) {
       lib.activateOverlay()
     } else {
       this.electronWindow.focus()
@@ -264,6 +379,11 @@ class OverlayControllerGlobal {
   focusTarget () {
     this.focusNext = 'target'
     this.electronWindow?.setIgnoreMouseEvents(true)
+    if (this.layerShell) {
+      releaseLayerKeyboards()
+      this.tracker?.focusTarget()
+      return
+    }
     lib.focusTarget()
   }
 
@@ -294,21 +414,62 @@ class OverlayControllerGlobal {
       this.calculateMacTitleBarHeight()
     }
 
+    if (this.layerShell) {
+      this.attachLayerShell(targetWindowTitles)
+      return
+    }
+
     lib.start(
       this.electronWindow?.getNativeWindowHandle(),
       targetWindowTitles,
       this.handler.bind(this))
   }
 
+  private attachLayerShell (titles: string[]) {
+    const host = WaylandHost.get()!
+    if (this.electronWindow) adoptLayerWindow(this.electronWindow)
+    this.layerTitles = titles
+    void host.ready().then(() => {
+      titles = this.layerTitles
+      if (!host.features) {
+        console.error('[electron-overlay-window] the Wayland host did not start; the target is not tracked')
+        return
+      }
+      if (host.features.foreignToplevel) {
+        this.tracker = new ToplevelTracker(host, titles, (event) => this.emitTrackerEvent(event))
+        return
+      }
+      // KWin and others without foreign-toplevel management: follow an
+      // XWayland target through the X11 backend in tracking-only mode.
+      this.x11Arbiter = new FocusArbiter((event) => this.emitTrackerEvent(event))
+      lib.start(undefined, titles, this.handler.bind(this))
+    })
+  }
+
+  /** Whether the layer-shell backend has not chosen its tracker yet. */
+  private get layerTrackerPending (): boolean {
+    return this.layerShell && !this.tracker && !this.x11Arbiter
+  }
+
   setTargetTitles (titles: string[]) {
-    lib.setTargetTitles(titles)
+    if (this.layerTrackerPending) this.layerTitles = titles
+    else if (this.tracker) this.tracker.setTitles(titles)
+    else lib.setTargetTitles(titles)
   }
 
   clearTarget () {
-    lib.clearTarget()
+    if (this.layerTrackerPending) this.layerTitles = []
+    else if (this.tracker) this.tracker.clear()
+    else lib.clearTarget()
   }
 
   stopHook () {
+    if (this.tracker) {
+      this.tracker.stop()
+      this.tracker = null
+      return
+    }
+    this.x11Arbiter?.stop()
     lib.stopHook()
   }
 

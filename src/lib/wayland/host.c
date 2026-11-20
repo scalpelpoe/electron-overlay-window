@@ -332,7 +332,9 @@ struct buffer {
 	struct wl_list link; /* in surface.retired while retired */
 	struct surface *owner;
 	struct wl_buffer *wl;
+	uint32_t pool;
 	int index;
+	/* Attached to a surface and not yet released by the compositor. */
 	bool busy, retired;
 };
 
@@ -367,7 +369,10 @@ struct surface {
 	struct buffer *buffers[2];
 	int32_t buffer_width, buffer_height;
 	struct wl_list retired;
-	int last_index;
+	uint32_t pool;
+	/* Buffer committed while the surface could not show it, presented on the
+	 * next configure. Never attached, so it is not busy. */
+	int pending_index;
 };
 
 struct toplevel {
@@ -887,10 +892,11 @@ static struct surface *surface_from_wl(struct wl_surface *wl)
 	return NULL;
 }
 
-static void emit_release(struct surface *surface, int index)
+static void emit_release(struct surface *surface, uint32_t pool, int index)
 {
 	ev_begin("release");
 	ev_sid(surface);
+	ev_int("pool", pool);
 	ev_int("index", index);
 	ev_end();
 }
@@ -913,7 +919,7 @@ static void buffer_release(void *data, struct wl_buffer *wl)
 	if (!buffer->busy)
 		return;
 	buffer->busy = false;
-	emit_release(buffer->owner, buffer->index);
+	emit_release(buffer->owner, buffer->pool, buffer->index);
 }
 
 static const struct wl_buffer_listener buffer_listener = {
@@ -970,9 +976,9 @@ static void keyboard_clear_focus(void)
 	keyboard_stop_repeat();
 }
 
-/* Destroys the layer surface and wl_surface. Busy buffers of the current pool
- * become free; `release` is emitted for them when emit_releases is set. */
-static void surface_unmap(struct surface *surface, bool emit_releases)
+/* Destroys the layer surface and wl_surface. Attached buffers stay busy until
+ * the compositor releases them. */
+static void surface_unmap(struct surface *surface)
 {
 	if (!surface->wl)
 		return;
@@ -994,15 +1000,6 @@ static void surface_unmap(struct surface *surface, bool emit_releases)
 	surface->wl = NULL;
 	surface->output = NULL;
 	surface->configured = false;
-	surface_destroy_retired(surface);
-	for (int i = 0; i < 2; i++) {
-		struct buffer *buffer = surface->buffers[i];
-		if (!buffer || !buffer->busy)
-			continue;
-		buffer->busy = false;
-		if (emit_releases)
-			emit_release(surface, i);
-	}
 }
 
 static void surface_apply_geometry(struct surface *surface)
@@ -1102,30 +1099,25 @@ static void layer_surface_configure(void *data, struct zwlr_layer_surface_v1 *la
 {
 	struct surface *surface = data;
 	zwlr_layer_surface_v1_ack_configure(layer, serial);
-	/* A new layer surface shows the last committed buffer again, which makes
-	 * that buffer busy; `attached` tells the client so it does not reuse it. */
-	int attached = -1;
-	if (!surface->configured) {
-		surface->configured = true;
-		if (surface->last_index >= 0 && surface->buffers[surface->last_index])
-			attached = surface->last_index;
-	}
 	ev_begin("configure");
 	ev_sid(surface);
 	ev_int("width", width);
 	ev_int("height", height);
-	ev_int("attached", attached);
 	ev_end();
-	if (attached >= 0)
-		surface_present(surface, attached, NULL);
-	else
+	int pending = surface->configured ? -1 : surface->pending_index;
+	surface->configured = true;
+	if (pending >= 0 && surface->buffers[pending]) {
+		surface->pending_index = -1;
+		surface_present(surface, pending, NULL);
+	} else {
 		wl_surface_commit(surface->wl);
+	}
 }
 
 static void layer_surface_closed(void *data, struct zwlr_layer_surface_v1 *layer)
 {
 	struct surface *surface = data;
-	surface_unmap(surface, true);
+	surface_unmap(surface);
 	surface->visible = false;
 	ev_begin("closed");
 	ev_sid(surface);
@@ -1178,7 +1170,7 @@ static void surface_buffers_destroy(struct surface *surface)
 
 static void surface_destroy(struct surface *surface)
 {
-	surface_unmap(surface, false);
+	surface_unmap(surface);
 	surface_buffers_destroy(surface);
 	wl_list_remove(&surface->link);
 	free(surface->sid);
@@ -2330,7 +2322,11 @@ static void registry_global_remove(void *data, struct wl_registry *registry, uin
 		return;
 	}
 	if (name == host.layer_shell_global && host.layer_shell) {
-		zwlr_layer_shell_v1_destroy(host.layer_shell);
+		if (zwlr_layer_shell_v1_get_version(host.layer_shell) >=
+		    ZWLR_LAYER_SHELL_V1_DESTROY_SINCE_VERSION)
+			zwlr_layer_shell_v1_destroy(host.layer_shell);
+		else
+			wl_proxy_destroy((struct wl_proxy *)host.layer_shell);
 		host.layer_shell = NULL;
 	} else if (name == host.viewporter_global && host.viewporter) {
 		wp_viewporter_destroy(host.viewporter);
@@ -2397,7 +2393,7 @@ static void cmd_create(char **argv, size_t argc)
 	struct surface *surface = xcalloc(1, sizeof(*surface));
 	surface->sid = xstrdup(argv[1]);
 	surface->numeric_sid = sid_is_numeric(argv[1]);
-	surface->last_index = -1;
+	surface->pending_index = -1;
 	surface->layer_kind = ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY;
 	wl_list_init(&surface->retired);
 	wl_list_insert(host.surfaces.prev, &surface->link);
@@ -2431,7 +2427,7 @@ static void cmd_geometry(char **argv, size_t argc)
 		return;
 	}
 	if (output_for_rect(&rect) != surface->output) {
-		surface_unmap(surface, true);
+		surface_unmap(surface);
 		surface_map(surface);
 		return;
 	}
@@ -2492,7 +2488,7 @@ static void cmd_layer(char **argv, size_t argc)
 		wl_surface_commit(surface->wl);
 		return;
 	}
-	surface_unmap(surface, true);
+	surface_unmap(surface);
 	surface_map(surface);
 }
 
@@ -2567,7 +2563,7 @@ static void cmd_hide(char **argv, size_t argc)
 	if (!surface)
 		return;
 	surface->visible = false;
-	surface_unmap(surface, true);
+	surface_unmap(surface);
 }
 
 static void cmd_raise(char **argv, size_t argc)
@@ -2575,7 +2571,7 @@ static void cmd_raise(char **argv, size_t argc)
 	struct surface *surface = command_surface(argv[0], argv[1]);
 	if (!surface || !surface->wl)
 		return;
-	surface_unmap(surface, true);
+	surface_unmap(surface);
 	surface_map(surface);
 }
 
@@ -2600,11 +2596,16 @@ static void cmd_buffers(char **argv, size_t argc)
 	struct surface *surface = command_surface(argv[0], argv[1]);
 	if (!surface)
 		return;
+	int32_t pool_id;
+	if (!parse_i32(argv[2], &pool_id) || pool_id < 0) {
+		log_msg("buffers: invalid pool");
+		return;
+	}
 	/* Fields are split at every space, so rejoining them restores paths
 	 * that contain spaces. */
-	for (size_t i = 2; i < argc - 3; i++)
+	for (size_t i = 3; i < argc - 3; i++)
 		argv[i][strlen(argv[i])] = ' ';
-	const char *path = argv[2];
+	const char *path = argv[3];
 	int32_t width, height;
 	if (!parse_i32(argv[argc - 2], &width) || !parse_i32(argv[argc - 1], &height) ||
 	    width < 1 || height < 1 || (int64_t)width * height * 8 > INT32_MAX) {
@@ -2640,6 +2641,7 @@ static void cmd_buffers(char **argv, size_t argc)
 		}
 		struct buffer *buffer = xcalloc(1, sizeof(*buffer));
 		buffer->owner = surface;
+		buffer->pool = (uint32_t)pool_id;
 		buffer->index = i;
 		buffer->wl = wl_shm_pool_create_buffer(pool, i * size, width, height, width * 4,
 						       WL_SHM_FORMAT_ARGB8888);
@@ -2649,10 +2651,12 @@ static void cmd_buffers(char **argv, size_t argc)
 	wl_shm_pool_destroy(pool);
 	surface->buffer_width = width;
 	surface->buffer_height = height;
-	surface->last_index = -1;
+	surface->pool = (uint32_t)pool_id;
+	surface->pending_index = -1;
 
 	ev_begin("buffers");
 	ev_sid(surface);
+	ev_int("pool", pool_id);
 	ev_str("path", path);
 	ev_end();
 }
@@ -2660,23 +2664,33 @@ static void cmd_buffers(char **argv, size_t argc)
 static void cmd_commit(char **argv, size_t argc)
 {
 	struct surface *surface = command_surface(argv[0], argv[1]);
-	int32_t index;
+	int32_t pool, index;
 	struct rect damage;
 	if (!surface)
 		return;
-	if (!parse_i32(argv[2], &index) || index < 0 || index > 1 ||
-	    !parse_i32(argv[3], &damage.x) || !parse_i32(argv[4], &damage.y) ||
-	    !parse_i32(argv[5], &damage.width) || !parse_i32(argv[6], &damage.height)) {
+	if (!parse_i32(argv[2], &pool) || pool < 0 || !parse_i32(argv[3], &index) || index < 0 ||
+	    index > 1 || !parse_i32(argv[4], &damage.x) || !parse_i32(argv[5], &damage.y) ||
+	    !parse_i32(argv[6], &damage.width) || !parse_i32(argv[7], &damage.height)) {
 		log_msg("commit: invalid arguments");
 		return;
 	}
-	if (!surface->buffers[index]) {
-		log_msg("commit %s: no buffers", surface->sid);
+	if (!surface->buffers[index] || surface->pool != (uint32_t)pool) {
+		/* The pool failed to open or was replaced. The buffer was never
+		 * attached, so hand it straight back. */
+		log_msg("commit %s: pool %d is not current", surface->sid, pool);
+		emit_release(surface, (uint32_t)pool, index);
 		return;
 	}
-	surface->last_index = index;
-	if (surface->wl && surface->configured)
+	if (surface->wl && surface->configured) {
 		surface_present(surface, index, &damage);
+		return;
+	}
+	/* Only the newest frame is shown once configured; return the one it
+	 * supersedes, which was never attached. */
+	int previous = surface->pending_index;
+	surface->pending_index = index;
+	if (previous >= 0 && previous != index && !surface->buffers[previous]->busy)
+		emit_release(surface, surface->pool, previous);
 }
 
 static void cmd_cursor(char **argv, size_t argc)
@@ -2761,8 +2775,8 @@ static const struct command {
 	{ "show", 2, 2, cmd_show },
 	{ "hide", 2, 2, cmd_hide },
 	{ "raise", 2, 2, cmd_raise },
-	{ "buffers", 5, 0, cmd_buffers },
-	{ "commit", 7, 7, cmd_commit },
+	{ "buffers", 6, 0, cmd_buffers },
+	{ "commit", 8, 8, cmd_commit },
 	{ "cursor", 3, 3, cmd_cursor },
 	{ "activate", 2, 2, cmd_activate },
 	{ "clipboard-set", 2, 3, cmd_clipboard_set },
