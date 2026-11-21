@@ -1,6 +1,6 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.OverlayController = exports.waylandClipboard = exports.waylandNative = exports.LAYER_SHELL_WEB_PREFERENCES = exports.OVERLAY_WINDOW_OPTS = exports.setLayerShortcutHandler = exports.releaseLayerKeyboards = exports.getLayerPointer = exports.getLayerWindow = exports.adoptLayerWindow = exports.probeWaylandHost = exports.layerShellUsable = void 0;
+exports.OverlayController = exports.waylandClipboard = exports.waylandNative = exports.LAYER_SHELL_WEB_PREFERENCES = exports.OVERLAY_WINDOW_OPTS = exports.setLayerShortcutHandler = exports.releaseLayerKeyboards = exports.getLayerPointer = exports.getLayerWindow = exports.adoptLayerWindow = exports.windowTracking = exports.probeWaylandHost = exports.layerShellUsable = void 0;
 const node_events_1 = require("node:events");
 const node_path_1 = require("node:path");
 const throttle_debounce_1 = require("throttle-debounce");
@@ -14,6 +14,7 @@ const lib = require('node-gyp-build')((0, node_path_1.join)(__dirname, '..'));
 var host_2 = require("./wayland/host");
 Object.defineProperty(exports, "layerShellUsable", { enumerable: true, get: function () { return host_2.layerShellUsable; } });
 Object.defineProperty(exports, "probeWaylandHost", { enumerable: true, get: function () { return host_2.probeWaylandHost; } });
+Object.defineProperty(exports, "windowTracking", { enumerable: true, get: function () { return host_2.windowTracking; } });
 var layer_window_2 = require("./wayland/layer-window");
 Object.defineProperty(exports, "adoptLayerWindow", { enumerable: true, get: function () { return layer_window_2.adoptLayerWindow; } });
 Object.defineProperty(exports, "getLayerWindow", { enumerable: true, get: function () { return layer_window_2.getLayerWindow; } });
@@ -413,12 +414,12 @@ class OverlayControllerGlobal {
                 console.error('[electron-overlay-window] the Wayland host did not start; the target is not tracked');
                 return;
             }
-            if (host.features.foreignToplevel) {
+            if ((0, host_1.windowTracking)(host.features)) {
                 this.tracker = new tracker_1.ToplevelTracker(host, titles, (event) => this.emitTrackerEvent(event));
                 return;
             }
-            // KWin and others without foreign-toplevel management: follow an
-            // XWayland target through the X11 backend in tracking-only mode.
+            // Compositors without a way to track windows: follow an XWayland
+            // target through the X11 backend in tracking-only mode.
             this.x11Arbiter = new tracker_1.FocusArbiter((event) => this.emitTrackerEvent(event));
             lib.start(undefined, titles, this.handler.bind(this));
         });

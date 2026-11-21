@@ -39,9 +39,11 @@
 #include "wlr-virtual-pointer-unstable-v1-client-protocol.h"
 #include "xdg-output-unstable-v1-client-protocol.h"
 
+#include "host.h"
+
 #define ARRAY_LEN(a) (sizeof(a) / sizeof((a)[0]))
 
-#define NAMESPACE "electron-overlay-window"
+#define NAMESPACE HOST_NAMESPACE
 #define CLIPBOARD_READ_MAX (8u << 20)
 #define COMMAND_LINE_MAX ((size_t)256 << 20)
 #define REPEAT_BURST_MAX 32
@@ -58,9 +60,7 @@
 
 /* Utilities */
 
-static void log_msg(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
-
-static void log_msg(const char *fmt, ...)
+void log_msg(const char *fmt, ...)
 {
 	va_list args;
 	va_start(args, fmt);
@@ -70,7 +70,7 @@ static void log_msg(const char *fmt, ...)
 	va_end(args);
 }
 
-static void *xrealloc(void *ptr, size_t size)
+void *xrealloc(void *ptr, size_t size)
 {
 	void *result = realloc(ptr, size ? size : 1);
 	if (!result) {
@@ -80,7 +80,7 @@ static void *xrealloc(void *ptr, size_t size)
 	return result;
 }
 
-static void *xcalloc(size_t count, size_t size)
+void *xcalloc(size_t count, size_t size)
 {
 	void *result = calloc(count ? count : 1, size ? size : 1);
 	if (!result) {
@@ -90,7 +90,7 @@ static void *xcalloc(size_t count, size_t size)
 	return result;
 }
 
-static char *xstrdup(const char *str)
+char *xstrdup(const char *str)
 {
 	size_t len = strlen(str) + 1;
 	char *copy = xrealloc(NULL, len);
@@ -272,7 +272,7 @@ static bool base64_decode(const char *in, char **out, size_t *out_len)
 	return true;
 }
 
-static bool parse_double(const char *str, double *out)
+bool parse_double(const char *str, double *out)
 {
 	if (!*str)
 		return false;
@@ -307,7 +307,7 @@ static bool parse_i32(const char *str, int32_t *out)
 	return true;
 }
 
-static bool parse_u32(const char *str, uint32_t *out)
+bool parse_u32(const char *str, uint32_t *out)
 {
 	if (*str < '0' || *str > '9')
 		return false;
@@ -486,6 +486,9 @@ struct probe_surface {
 
 static struct host {
 	bool probe, ready;
+	/* Fallback for compositors without the wlroots protocols, decided
+	 * before `ready`. */
+	bool kwin_script;
 	struct wl_display *display;
 	struct wl_registry *registry;
 
@@ -612,21 +615,21 @@ static void stdout_write(const char *data, size_t len)
 	}
 }
 
-static void ev_begin(const char *name)
+void ev_begin(const char *name)
 {
 	host.event.len = 0;
 	sb_puts(&host.event, "{\"ev\":");
 	json_string(&host.event, name, strlen(name));
 }
 
-static void ev_key(const char *key)
+void ev_key(const char *key)
 {
 	sb_putc(&host.event, ',');
 	json_string(&host.event, key, strlen(key));
 	sb_putc(&host.event, ':');
 }
 
-static void ev_strn(const char *key, const char *value, size_t len)
+void ev_strn(const char *key, const char *value, size_t len)
 {
 	ev_key(key);
 	if (value)
@@ -635,27 +638,46 @@ static void ev_strn(const char *key, const char *value, size_t len)
 		sb_puts(&host.event, "null");
 }
 
-static void ev_str(const char *key, const char *value)
+void ev_str(const char *key, const char *value)
 {
 	ev_strn(key, value, value ? strlen(value) : 0);
 }
 
-static void ev_int(const char *key, long long value)
+void ev_int(const char *key, long long value)
 {
 	ev_key(key);
 	sb_printf(&host.event, "%lld", value);
 }
 
-static void ev_num(const char *key, double value)
+void ev_num(const char *key, double value)
 {
 	ev_key(key);
 	sb_printf(&host.event, "%.10g", value == value ? value : 0.0);
 }
 
-static void ev_bool(const char *key, bool value)
+void ev_bool(const char *key, bool value)
 {
 	ev_key(key);
 	sb_puts(&host.event, value ? "true" : "false");
+}
+
+void ev_strings(const char *key, const char *const *values, size_t count)
+{
+	ev_key(key);
+	sb_putc(&host.event, '[');
+	for (size_t i = 0; i < count; i++) {
+		if (i > 0)
+			sb_putc(&host.event, ',');
+		json_string(&host.event, values[i], strlen(values[i]));
+	}
+	sb_putc(&host.event, ']');
+}
+
+void ev_rect(const char *key, int32_t x, int32_t y, int32_t width, int32_t height)
+{
+	ev_key(key);
+	sb_printf(&host.event, "{\"x\":%d,\"y\":%d,\"width\":%d,\"height\":%d}", x, y, width,
+		  height);
 }
 
 /* Numeric sids are echoed as JSON numbers, anything else as strings. */
@@ -668,7 +690,7 @@ static void ev_sid(const struct surface *surface)
 		json_string(&host.event, surface->sid, strlen(surface->sid));
 }
 
-static void ev_end(void)
+void ev_end(void)
 {
 	sb_puts(&host.event, "}\n");
 	stdout_write(host.event.data, host.event.len);
@@ -690,10 +712,8 @@ static void fatal(const char *fmt, ...)
 	exit(1);
 }
 
-static void emit_error(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
-
 /* Non-fatal error the client may be waiting on, such as a failed pool. */
-static void emit_error(const char *fmt, ...)
+void emit_error(const char *fmt, ...)
 {
 	char message[512];
 	va_list args;
@@ -1752,6 +1772,11 @@ static void keyboard_release(void)
 
 /* Foreign toplevels */
 
+uint32_t toplevel_next_id(void)
+{
+	return host.next_toplevel_id++;
+}
+
 static void toplevel_emit(struct toplevel *toplevel)
 {
 	ev_begin("toplevel");
@@ -1875,7 +1900,7 @@ static void toplevel_manager_toplevel(void *data, struct zwlr_foreign_toplevel_m
 				      struct zwlr_foreign_toplevel_handle_v1 *handle)
 {
 	struct toplevel *toplevel = xcalloc(1, sizeof(*toplevel));
-	toplevel->id = host.next_toplevel_id++;
+	toplevel->id = toplevel_next_id();
 	toplevel->handle = handle;
 	wl_list_insert(host.toplevels.prev, &toplevel->link);
 	zwlr_foreign_toplevel_handle_v1_add_listener(handle, &toplevel_listener, toplevel);
@@ -2516,7 +2541,7 @@ static const struct wl_registry_listener registry_listener = {
 
 /* Shared helpers for input injection, capture and probing */
 
-static uint32_t now_ms(void)
+uint32_t now_ms(void)
 {
 	struct timespec ts;
 	clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -2530,7 +2555,7 @@ static void timer_arm(int fd, long ms)
 	timerfd_settime(fd, 0, &spec, NULL);
 }
 
-static bool write_all(int fd, const void *data, size_t len)
+bool write_all(int fd, const void *data, size_t len)
 {
 	const char *ptr = data;
 	while (len > 0) {
@@ -4020,6 +4045,8 @@ static void cmd_activate(char **argv, size_t argc)
 		log_msg("activate: invalid toplevel id %s", argv[1]);
 		return;
 	}
+	if (kwin_activate(id))
+		return;
 	if (!host.seat) {
 		log_msg("activate: no seat");
 		return;
@@ -4193,16 +4220,28 @@ static void emit_ready(void)
 	ev_bool("uinput", access(UINPUT_PATH, W_OK) == 0);
 	ev_bool("virtualPointer", host.vp_manager != NULL);
 	ev_bool("screencopy", host.screencopy != NULL);
+	ev_bool("kwinScript", host.kwin_script);
 	ev_end();
 }
 
-enum poll_slot { SLOT_DISPLAY, SLOT_STDIN, SLOT_REPEAT, SLOT_PROBE, SLOT_INOTIFY, SLOT_FIXED_COUNT };
+enum poll_slot {
+	SLOT_DISPLAY,
+	SLOT_STDIN,
+	SLOT_REPEAT,
+	SLOT_PROBE,
+	SLOT_INOTIFY,
+	SLOT_BUS,
+	SLOT_FIXED_COUNT
+};
 
 static void run(void)
 {
 	struct pollfd *pfds = NULL;
 	size_t pfds_cap = 0;
 	for (;;) {
+		/* Blocking D-Bus calls may have queued messages without the fd
+		 * becoming readable again. */
+		bus_dispatch(false);
 		while (wl_display_prepare_read(host.display) != 0) {
 			if (wl_display_dispatch_pending(host.display) < 0)
 				display_failed();
@@ -4233,6 +4272,7 @@ static void run(void)
 		pfds[SLOT_PROBE] = (struct pollfd){ host.probe_fd, POLLIN, 0 };
 		/* poll ignores negative fds, which stand for off. */
 		pfds[SLOT_INOTIFY] = (struct pollfd){ host.evdev_inotify_fd, POLLIN, 0 };
+		pfds[SLOT_BUS] = (struct pollfd){ bus_fd(), POLLIN, 0 };
 		size_t n = SLOT_FIXED_COUNT;
 		struct evdev_device *device, *device_tmp;
 		wl_list_for_each(device, &host.evdev_devices, link)
@@ -4266,6 +4306,8 @@ static void run(void)
 			probe_handle_timer();
 		if (pfds[SLOT_INOTIFY].revents & POLLIN)
 			evdev_inotify_read();
+		if (pfds[SLOT_BUS].revents)
+			bus_dispatch(true);
 
 		/* Dispatching may have replaced devices, reads and writes, so the
 		 * poll results are matched to the current ones by fd. Spurious
@@ -4363,6 +4405,9 @@ int main(int argc, char **argv)
 	if (host.keyboard && !host.keymap && wl_display_roundtrip(host.display) < 0)
 		display_failed();
 
+	/* Only looked for where the wlroots protocol is missing, so that other
+	 * compositors never wait for the session bus. */
+	host.kwin_script = !host.toplevel_global && kwin_available();
 	emit_ready();
 	if (host.probe) {
 		wl_display_disconnect(host.display);
@@ -4373,6 +4418,8 @@ int main(int argc, char **argv)
 	host.outputs_dirty = true;
 	toplevel_manager_bind();
 	dc_manager_bind();
+	if (host.kwin_script)
+		kwin_start();
 	run();
 	wl_display_flush(host.display);
 	return 0;

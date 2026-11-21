@@ -11,6 +11,9 @@ export interface HostFeatures {
     uinput: boolean;
     virtualPointer: boolean;
     screencopy: boolean;
+    /** Windows are tracked through a KWin script, because the compositor lacks
+     *  foreign-toplevel management. Untested on Plasma. */
+    kwinScript: boolean;
 }
 /** An output in global logical coordinates. */
 export interface WaylandOutput {
@@ -31,6 +34,14 @@ export interface ToplevelInfo {
     maximized: boolean;
     minimized: boolean;
     outputs: string[];
+    /** Global logical bounds of the window's content. Only KWin reports them;
+     *  foreign-toplevel management has no positions. */
+    geometry?: {
+        x: number;
+        y: number;
+        width: number;
+        height: number;
+    };
 }
 export interface KeyMods {
     shift: boolean;
@@ -121,6 +132,9 @@ export type KeyboardMode = 'none' | 'on_demand' | 'exclusive';
 export declare function hostExecutablePath(): string | null;
 /** Whether overlays can be presented as layer surfaces, from a probe result. */
 export declare function layerShellUsable(features: HostFeatures | null): boolean;
+/** How the host follows the target's focus and bounds, or null when it
+ *  cannot. Without one, an XWayland target can still be tracked through X11. */
+export declare function windowTracking(features: HostFeatures | null): 'foreign-toplevel' | 'kwin-script' | null;
 /** Synchronously asks the compositor which globals it offers. Returns null when
  *  the host is missing, no Wayland compositor is reachable, or the probe fails.
  *  Safe to call before Electron's `ready` event, so an app can choose its Ozone

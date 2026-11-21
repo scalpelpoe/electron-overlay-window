@@ -3,13 +3,13 @@ import { join } from 'node:path'
 import { throttle } from 'throttle-debounce'
 import { screen } from 'electron'
 import { BrowserWindow, Rectangle, BrowserWindowConstructorOptions, WebPreferences } from 'electron'
-import { layerShellUsable, probeWaylandHost, WaylandHost } from './wayland/host'
+import { layerShellUsable, probeWaylandHost, WaylandHost, windowTracking } from './wayland/host'
 import { adoptLayerWindow, releaseLayerKeyboards } from './wayland/layer-window'
 import { FocusArbiter, ToplevelTracker, type TrackerEvent, x11BoundsToLogical } from './wayland/tracker'
 import { captureScreenRegion, listenNativeInput, type NativeInputEvent } from './wayland/native-input'
 const lib: AddonExports = require('node-gyp-build')(join(__dirname, '..'))
 
-export { layerShellUsable, probeWaylandHost, type HostFeatures, type WaylandOutput } from './wayland/host'
+export { layerShellUsable, probeWaylandHost, windowTracking, type HostFeatures, type WaylandOutput } from './wayland/host'
 export {
   adoptLayerWindow,
   getLayerWindow,
@@ -482,12 +482,12 @@ class OverlayControllerGlobal {
         console.error('[electron-overlay-window] the Wayland host did not start; the target is not tracked')
         return
       }
-      if (host.features.foreignToplevel) {
+      if (windowTracking(host.features)) {
         this.tracker = new ToplevelTracker(host, titles, (event) => this.emitTrackerEvent(event))
         return
       }
-      // KWin and others without foreign-toplevel management: follow an
-      // XWayland target through the X11 backend in tracking-only mode.
+      // Compositors without a way to track windows: follow an XWayland
+      // target through the X11 backend in tracking-only mode.
       this.x11Arbiter = new FocusArbiter((event) => this.emitTrackerEvent(event))
       lib.start(undefined, titles, this.handler.bind(this))
     })

@@ -16,6 +16,9 @@ export interface HostFeatures {
   uinput: boolean
   virtualPointer: boolean
   screencopy: boolean
+  /** Windows are tracked through a KWin script, because the compositor lacks
+   *  foreign-toplevel management. Untested on Plasma. */
+  kwinScript: boolean
 }
 
 /** An output in global logical coordinates. */
@@ -38,6 +41,9 @@ export interface ToplevelInfo {
   maximized: boolean
   minimized: boolean
   outputs: string[]
+  /** Global logical bounds of the window's content. Only KWin reports them;
+   *  foreign-toplevel management has no positions. */
+  geometry?: { x: number; y: number; width: number; height: number }
 }
 
 export interface KeyMods {
@@ -111,6 +117,14 @@ const MIN_LAYER_SHELL_VERSION = 4
 /** Whether overlays can be presented as layer surfaces, from a probe result. */
 export function layerShellUsable (features: HostFeatures | null): boolean {
   return !!features?.layerShell && features.layerShellVersion >= MIN_LAYER_SHELL_VERSION
+}
+
+/** How the host follows the target's focus and bounds, or null when it
+ *  cannot. Without one, an XWayland target can still be tracked through X11. */
+export function windowTracking (features: HostFeatures | null): 'foreign-toplevel' | 'kwin-script' | null {
+  if (features?.foreignToplevel) return 'foreign-toplevel'
+  if (features?.kwinScript) return 'kwin-script'
+  return null
 }
 
 /** Synchronously asks the compositor which globals it offers. Returns null when

@@ -1,6 +1,8 @@
 {
   'variables': {
-    'wayland_host%': '<!(node -e "try{require(\'child_process\').execSync(\'pkg-config --exists wayland-client wayland-cursor xkbcommon wayland-scanner\');console.log(process.platform===\'linux\'?1:0)}catch{console.log(0)}")'
+    'wayland_host%': '<!(node -e "try{require(\'child_process\').execSync(\'pkg-config --exists wayland-client wayland-cursor xkbcommon wayland-scanner\');console.log(process.platform===\'linux\'?1:0)}catch{console.log(0)}")',
+    # Optional: KWin window tracking needs libdbus, which Electron links anyway.
+    'wayland_dbus%': '<!(node -e "try{require(\'child_process\').execSync(\'pkg-config --exists dbus-1\');console.log(1)}catch{console.log(0)}")'
   },
   'targets': [
     {
@@ -115,7 +117,24 @@
             'libraries': [
               '<!@(pkg-config --libs wayland-client wayland-cursor xkbcommon)'
             ]
-          }
+          },
+          'conditions': [
+            ['wayland_dbus==1', {
+              'defines': [
+                'HAVE_DBUS'
+              ],
+              'cflags': ['<!@(pkg-config --cflags dbus-1)'],
+              'sources': [
+                'src/lib/wayland/bus.c',
+                'src/lib/wayland/kwin.c'
+              ],
+              'link_settings': {
+                'libraries': [
+                  '<!@(pkg-config --libs dbus-1)'
+                ]
+              }
+            }]
+          ]
         }
       ]
     }]

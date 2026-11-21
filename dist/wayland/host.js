@@ -3,6 +3,7 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.WaylandHost = void 0;
 exports.hostExecutablePath = hostExecutablePath;
 exports.layerShellUsable = layerShellUsable;
+exports.windowTracking = windowTracking;
 exports.probeWaylandHost = probeWaylandHost;
 const node_child_process_1 = require("node:child_process");
 const node_fs_1 = require("node:fs");
@@ -28,6 +29,15 @@ const MIN_LAYER_SHELL_VERSION = 4;
 /** Whether overlays can be presented as layer surfaces, from a probe result. */
 function layerShellUsable(features) {
     return !!features?.layerShell && features.layerShellVersion >= MIN_LAYER_SHELL_VERSION;
+}
+/** How the host follows the target's focus and bounds, or null when it
+ *  cannot. Without one, an XWayland target can still be tracked through X11. */
+function windowTracking(features) {
+    if (features?.foreignToplevel)
+        return 'foreign-toplevel';
+    if (features?.kwinScript)
+        return 'kwin-script';
+    return null;
 }
 /** Synchronously asks the compositor which globals it offers. Returns null when
  *  the host is missing, no Wayland compositor is reachable, or the probe fails.

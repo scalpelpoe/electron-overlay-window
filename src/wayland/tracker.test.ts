@@ -128,6 +128,21 @@ describe('ToplevelTracker', () => {
     assert.deepEqual(events[events.length - 1], { type: 'moveresize', x: 2560, y: 0, width: 1920, height: 1080 })
   })
 
+  it('uses reported geometry over the output bounds', () => {
+    host.set({ tid: 1, title: 'Path of Exile', activated: true, outputs: ['DP-1'], geometry: { x: 100, y: 50, width: 1280, height: 720 } })
+    host.set({ tid: 1, geometry: { x: 200, y: 50, width: 1280, height: 720 } })
+    assert.deepEqual(events, [
+      { type: 'attach', hasAccess: undefined, isFullscreen: false, titleIndex: 0, x: 100, y: 50, width: 1280, height: 720 },
+      { type: 'focus' },
+      { type: 'moveresize', x: 200, y: 50, width: 1280, height: 720 }
+    ])
+  })
+
+  it('falls back to the output for empty geometry', () => {
+    host.set({ tid: 1, title: 'Path of Exile', activated: true, outputs: ['DP-2'], geometry: { x: 0, y: 0, width: 0, height: 0 } })
+    assert.deepEqual(events[0], { type: 'attach', hasAccess: undefined, isFullscreen: false, titleIndex: 0, x: 2560, y: 0, width: 1920, height: 1080 })
+  })
+
   it('emits fullscreen changes', () => {
     host.set({ tid: 1, title: 'Path of Exile', activated: true, outputs: ['DP-1'] })
     host.set({ tid: 1, fullscreen: true })

@@ -88,13 +88,14 @@ class FocusArbiter {
 exports.FocusArbiter = FocusArbiter;
 /**
  * Finds the target among the compositor's toplevels
- * (`zwlr_foreign_toplevel_manager_v1`) by exact title. Like the X11 backend,
- * it attaches when a matching window becomes active and keeps following it
- * if its title changes afterwards.
+ * (`zwlr_foreign_toplevel_manager_v1`, or the host's KWin script) by exact
+ * title. Like the X11 backend, it attaches when a matching window becomes
+ * active and keeps following it if its title changes afterwards.
  *
- * The protocol reports a toplevel's outputs but not its position, so the
- * target's bounds are the logical bounds of its output. That is exact for
- * fullscreen and borderless-fullscreen windows.
+ * The target's bounds are its reported geometry. Foreign-toplevel management
+ * reports outputs but no positions, so there the bounds are those of the
+ * target's output, which is exact for fullscreen and borderless-fullscreen
+ * windows.
  */
 class ToplevelTracker {
     constructor(host, titles, emit) {
@@ -152,6 +153,9 @@ class ToplevelTracker {
             (outputs.length === 1 ? outputs[0] : null);
     }
     boundsOf(toplevel) {
+        const geometry = toplevel.geometry;
+        if (geometry && geometry.width > 0 && geometry.height > 0)
+            return { ...geometry };
         const output = this.outputOf(toplevel);
         if (output)
             return { x: output.x, y: output.y, width: output.width, height: output.height };

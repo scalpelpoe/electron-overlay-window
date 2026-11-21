@@ -47,9 +47,12 @@ app.whenReady().then(() => {
 ```
 
 - The target is found with `zwlr_foreign_toplevel_manager_v1` and covers its
-  output, so it must be fullscreen or borderless fullscreen. Compositors
-  without that protocol (KWin) fall back to tracking an XWayland target through
-  X11.
+  output, so it must be fullscreen or borderless fullscreen. On KWin, which
+  lacks that protocol, the host follows windows with a KWin script instead and
+  the overlay covers the target's own bounds (Plasma 6, built when `dbus-1` is
+  found; untested on Plasma). `windowTracking(features)` tells which applies.
+  Other compositors without either fall back to tracking an XWayland target
+  through X11.
 - Further overlay windows are presented with `adoptLayerWindow(win)`. Adopted
   windows keep the BrowserWindow API: bounds are global logical coordinates,
   `setIgnoreMouseEvents(true)` makes the window click-through except for the

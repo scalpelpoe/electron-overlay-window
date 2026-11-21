@@ -1,7 +1,7 @@
 import { EventEmitter } from 'node:events';
 import { BrowserWindow, Rectangle, BrowserWindowConstructorOptions, WebPreferences } from 'electron';
 import { type NativeInputEvent } from './wayland/native-input';
-export { layerShellUsable, probeWaylandHost, type HostFeatures, type WaylandOutput } from './wayland/host';
+export { layerShellUsable, probeWaylandHost, windowTracking, type HostFeatures, type WaylandOutput } from './wayland/host';
 export { adoptLayerWindow, getLayerWindow, getLayerPointer, releaseLayerKeyboards, type LayerWindow, type LayerWindowOptions } from './wayland/layer-window';
 export { setLayerShortcutHandler, type LayerShortcutKey } from './wayland/layer-window';
 export type { NativeInputEvent } from './wayland/native-input';
