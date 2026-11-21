@@ -10,6 +10,9 @@ const node_path_1 = require("node:path");
 const node_readline_1 = require("node:readline");
 const LOG_PREFIX = '[electron-overlay-window] wayland:';
 const RESTART_DELAY_MS = 1000;
+// Probes give up within about a second in the host; a capture waits for the
+// compositor, which may never answer.
+const REQUEST_TIMEOUT_MS = 3000;
 /** Locates the host executable, preferring the asar-unpacked copy that a
  *  packaged Electron app can execute. */
 function hostExecutablePath() {
@@ -73,6 +76,13 @@ class WaylandHost {
         this.outputListeners = new Set();
         this.restartListeners = new Set();
         this.readyWaiters = [];
+        this.evdevListeners = new Set();
+        this.pendingCaptures = new Map();
+        this.pendingProbes = new Map();
+        /** Keys and buttons reported down, released for listeners when the host goes away. */
+        this.heldEvdev = new Set();
+        this.nextRequest = 1;
+        this.evdevDevices = 0;
     }
     static get() {
         return WaylandHost.instance;
@@ -105,6 +115,24 @@ class WaylandHost {
         this.child?.stdin.end();
         this.child = null;
         this.resolveReady();
+        this.abandonRequests();
+    }
+    /** Settles requests and releases keys the current host process can no
+     *  longer answer or report. */
+    abandonRequests() {
+        for (const resolve of this.pendingCaptures.values())
+            resolve(null);
+        for (const resolve of this.pendingProbes.values())
+            resolve(null);
+        this.pendingCaptures.clear();
+        this.pendingProbes.clear();
+        this.evdevDevices = 0;
+        const held = [...this.heldEvdev];
+        this.heldEvdev.clear();
+        for (const code of held) {
+            for (const listener of this.evdevListeners)
+                listener({ kind: 'key', code, value: 0 });
+        }
     }
     spawn() {
         const child = (0, node_child_process_1.spawn)(this.path, [], { stdio: ['pipe', 'pipe', 'pipe'] });
@@ -126,6 +154,9 @@ class WaylandHost {
             }
         });
         (0, node_readline_1.createInterface)({ input: child.stdout }).on('line', (line) => this.handleLine(line));
+        // A restarted host starts with evdev off.
+        if (this.evdevListeners.size > 0)
+            this.send('evdev on');
         child.on('exit', (code, signal) => {
             if (this.child !== child)
                 return;
@@ -134,6 +165,7 @@ class WaylandHost {
                 return;
             console.error(LOG_PREFIX, `host exited (${signal ?? code}); restarting`);
             this.toplevels.clear();
+            this.abandonRequests();
             setTimeout(() => {
                 if (this.stopped)
                     return;
@@ -187,12 +219,57 @@ class WaylandHost {
             case 'error':
                 console.error(LOG_PREFIX, event.message);
                 break;
+            case 'evdev':
+                this.evdevDevices = event.devices;
+                break;
+            case 'input': {
+                const { ev: _, ...input } = event;
+                if (input.kind === 'key' && input.value === 1)
+                    this.heldEvdev.add(input.code);
+                else if (input.kind === 'key' && input.value === 0)
+                    this.heldEvdev.delete(input.code);
+                for (const listener of this.evdevListeners)
+                    listener(input);
+                break;
+            }
+            case 'capture': {
+                const resolve = this.pendingCaptures.get(event.id);
+                this.pendingCaptures.delete(event.id);
+                if ('error' in event)
+                    console.warn(LOG_PREFIX, 'capture failed:', event.error);
+                resolve?.('error' in event ? null : { width: event.width, height: event.height });
+                break;
+            }
+            case 'probe': {
+                const resolve = this.pendingProbes.get(event.id);
+                this.pendingProbes.delete(event.id);
+                resolve?.(event.x === null || event.y === null ? null : { x: event.x, y: event.y });
+                break;
+            }
         }
     }
+    /** Returns false when there is no host to send to. */
     send(line) {
         if (!this.child || this.child.stdin.destroyed)
-            return;
+            return false;
         this.child.stdin.write(line + '\n');
+        return true;
+    }
+    request(pending, id, line) {
+        return new Promise((resolve) => {
+            pending.set(id, resolve);
+            const timer = setTimeout(() => {
+                if (pending.get(id) !== resolve)
+                    return;
+                pending.delete(id);
+                resolve(null);
+            }, REQUEST_TIMEOUT_MS);
+            timer.unref?.();
+            if (this.send(line))
+                return;
+            pending.delete(id);
+            resolve(null);
+        });
     }
     onSurface(sid, listener) {
         this.surfaceListeners.set(sid, listener);
@@ -264,6 +341,40 @@ class WaylandHost {
         this.clipboardHtml = html ?? null;
         const encode = (value) => Buffer.from(value, 'utf8').toString('base64');
         this.send(`clipboard-set ${encode(text)} ${html ? encode(html) : '-'}`);
+    }
+    /** Reads keyboards and mice from evdev while there are listeners. */
+    onEvdev(listener) {
+        this.evdevListeners.add(listener);
+        if (this.evdevListeners.size === 1)
+            this.send('evdev on');
+        return () => {
+            this.evdevListeners.delete(listener);
+            if (this.evdevListeners.size === 0)
+                this.send('evdev off');
+        };
+    }
+    /** Presses or releases an evdev key on the host's virtual keyboard. */
+    virtualKey(code, pressed) {
+        this.send(`vkey ${code} ${pressed ? 1 : 0}`);
+    }
+    warpPointer(x, y) {
+        this.send(`warp ${Math.round(x)} ${Math.round(y)}`);
+    }
+    /** Captures a logical rectangle into `path` as BGRA. Resolves to the pixel
+     *  size, or null on failure. */
+    capture(rect, path) {
+        const id = `c${this.nextRequest++}`;
+        const r = [rect.x, rect.y, rect.width, rect.height].map(Math.round);
+        // The path ends the command line.
+        if (/[\r\n]/.test(path))
+            return Promise.resolve(null);
+        return this.request(this.pendingCaptures, id, `capture ${id} ${r.join(' ')} ${path}`);
+    }
+    /** Global logical pointer position, found by briefly mapping input
+     *  surfaces over every output. */
+    probePointer() {
+        const id = `p${this.nextRequest++}`;
+        return this.request(this.pendingProbes, id, `probe ${id}`);
     }
     clearClipboard() {
         this.clipboardText = null;

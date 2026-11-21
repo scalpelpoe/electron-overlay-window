@@ -1,8 +1,10 @@
 import { EventEmitter } from 'node:events';
 import { BrowserWindow, Rectangle, BrowserWindowConstructorOptions, WebPreferences } from 'electron';
+import { type NativeInputEvent } from './wayland/native-input';
 export { layerShellUsable, probeWaylandHost, type HostFeatures, type WaylandOutput } from './wayland/host';
 export { adoptLayerWindow, getLayerWindow, getLayerPointer, releaseLayerKeyboards, type LayerWindow, type LayerWindowOptions } from './wayland/layer-window';
-export { setLayerShortcutHandler } from './wayland/layer-window';
+export { setLayerShortcutHandler, type LayerShortcutKey } from './wayland/layer-window';
+export type { NativeInputEvent } from './wayland/native-input';
 export interface AttachEvent {
     hasAccess: boolean | undefined;
     isFullscreen: boolean | undefined;
@@ -28,6 +30,35 @@ export declare const OVERLAY_WINDOW_OPTS: BrowserWindowConstructorOptions;
 /** Web preferences a window needs before `adoptLayerWindow` can present it
  *  as a layer-shell surface. Merge into the window's own webPreferences. */
 export declare const LAYER_SHELL_WEB_PREFERENCES: WebPreferences;
+/**
+ * Input, pointer and capture for the target without any X server, for apps
+ * using the layer-shell backend. Each member returns null or false where the
+ * compositor or permissions do not allow it.
+ */
+export declare const waylandNative: {
+    /** Starts reading evdev (needs read access to /dev/input, usually the
+     *  `input` group). See `NativeInputEvent` for what is delivered when. */
+    listen(listener: (event: NativeInputEvent) => void): (() => void) | null;
+    /** Number of evdev devices being read; 0 usually means no permission. */
+    inputDevices(): number;
+    /** Presses or releases an evdev key, delivered to the focused window. */
+    key(code: number, pressed: boolean): boolean;
+    warpPointer(point: {
+        x: number;
+        y: number;
+    }): boolean;
+    probePointer(): Promise<{
+        x: number;
+        y: number;
+    } | null>;
+    canCapture(): boolean;
+    /** BGRA pixels of a logical screen rectangle, overlays included. */
+    capture(rect: Rectangle): Promise<{
+        width: number;
+        height: number;
+        data: Buffer;
+    } | null>;
+};
 /** Clipboard through the Wayland host's data-control connection. Chromium
  *  only sees the Wayland clipboard while one of its own windows is focused,
  *  which an overlay over a game never is. */

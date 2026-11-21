@@ -2,10 +2,11 @@
  * overlay-wayland-host: presents Electron overlay windows as layer-shell
  * surfaces. The wire protocol is documented in README.md next to this file.
  */
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
-#include <linux/input-event-codes.h>
+#include <linux/input.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -14,9 +15,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/inotify.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/timerfd.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <wayland-client.h>
@@ -26,9 +30,12 @@
 #include "cursor-shape-v1-client-protocol.h"
 #include "ext-data-control-v1-client-protocol.h"
 #include "viewporter-client-protocol.h"
+#include "virtual-keyboard-unstable-v1-client-protocol.h"
 #include "wlr-data-control-unstable-v1-client-protocol.h"
 #include "wlr-foreign-toplevel-management-unstable-v1-client-protocol.h"
 #include "wlr-layer-shell-unstable-v1-client-protocol.h"
+#include "wlr-screencopy-unstable-v1-client-protocol.h"
+#include "wlr-virtual-pointer-unstable-v1-client-protocol.h"
 #include "xdg-output-unstable-v1-client-protocol.h"
 
 #define ARRAY_LEN(a) (sizeof(a) / sizeof((a)[0]))
@@ -38,6 +45,14 @@
 #define COMMAND_LINE_MAX ((size_t)256 << 20)
 #define REPEAT_BURST_MAX 32
 #define SEAT_GLOBALS_MAX 16
+#define EVDEV_DIR "/dev/input"
+#define PROBE_NAMESPACE NAMESPACE "-probe"
+/* How long probe surfaces may take to be configured, and how long the pointer
+ * then has to enter one. */
+#define PROBE_MAP_TIMEOUT_MS 1000
+#define PROBE_ENTER_TIMEOUT_MS 200
+#define BITS_PER_LONG (sizeof(unsigned long) * CHAR_BIT)
+#define BITS_LONGS(bits) (((bits) + BITS_PER_LONG - 1) / BITS_PER_LONG)
 
 /* Utilities */
 
@@ -321,6 +336,8 @@ struct output {
 	struct rect logical;
 	bool has_logical_position, has_logical_size;
 	bool done;
+	/* Virtual pointer mapped to this output, from virtual-pointer v2. */
+	struct zwlr_virtual_pointer_v1 *vpointer;
 };
 
 enum keyboard_mode { KEYBOARD_NONE, KEYBOARD_ON_DEMAND, KEYBOARD_EXCLUSIVE };
@@ -429,6 +446,42 @@ struct seat_global {
 	uint32_t name, version;
 };
 
+struct evdev_device {
+	struct wl_list link;
+	int fd;
+	dev_t rdev;
+	char *name; /* entry in EVDEV_DIR */
+	/* Events are discarded from SYN_DROPPED until the next SYN_REPORT. */
+	bool dropping;
+	/* Keys and buttons currently down, to resync after SYN_DROPPED and to
+	 * release them when the device disappears. */
+	unsigned long keys[BITS_LONGS(KEY_CNT)];
+};
+
+struct capture {
+	struct wl_list link;
+	char *id, *path;
+	struct zwlr_screencopy_frame_v1 *frame;
+	struct wl_buffer *buffer;
+	void *data;
+	size_t size;
+	bool has_shm;
+	uint32_t format, width, height, stride, flags;
+	/* wl_output transform of the captured output, undone when writing. */
+	int32_t transform;
+};
+
+struct probe_surface {
+	struct wl_list link;
+	struct output *output;
+	struct wl_surface *wl;
+	struct zwlr_layer_surface_v1 *layer;
+	struct wp_viewport *viewport;
+	/* Transparent buffer of the configured size, used without wp_viewporter. */
+	struct wl_buffer *buffer;
+	bool committed;
+};
+
 static struct host {
 	bool probe, ready;
 	struct wl_display *display;
@@ -486,10 +539,49 @@ static struct host {
 	bool repeating;
 	int repeat_fd;
 
+	bool evdev_on;
+	int evdev_inotify_fd;
+	struct wl_list evdev_devices;
+	int evdev_reported; /* device count last emitted, -1 for none */
+	/* Devices holding each key, so a key held on two keyboards is reported
+	 * as one press and one release. */
+	uint16_t evdev_key_holders[KEY_CNT];
+
+	struct zwp_virtual_keyboard_manager_v1 *vk_manager;
+	uint32_t vk_manager_global;
+	struct zwp_virtual_keyboard_v1 *vk;
+	struct xkb_state *vk_state;
+	char *vk_keymap_text; /* the keymap uploaded to vk */
+	bool vk_default_keymap; /* vk was created before the seat sent a keymap */
+
+	struct zwlr_virtual_pointer_manager_v1 *vp_manager;
+	uint32_t vp_manager_global;
+	/* Pointer without an output, for warps with virtual-pointer v1 and for
+	 * probe nudges. */
+	struct zwlr_virtual_pointer_v1 *vpointer;
+
+	struct zwlr_screencopy_manager_v1 *screencopy;
+	uint32_t screencopy_global;
+	struct wl_list captures;
+
+	/* Concurrent probes share one set of surfaces and one result. */
+	char **probe_ids;
+	size_t probe_id_count;
+	struct wl_list probe_surfaces;
+	bool probe_mapped;
+	int probe_fd;
+	struct wl_buffer *probe_buffer; /* 1x1 transparent, shared */
+
 	struct strbuf stdin_buf;
 	bool stdin_discarding;
 	struct strbuf event;
 } host;
+
+static void probe_output_removed(struct output *output);
+static bool probe_pointer_enter(struct wl_surface *wl, wl_fixed_t x, wl_fixed_t y);
+static void vk_keymap_changed(void);
+static void vk_destroy(void);
+static void vp_destroy_all(void);
 
 /* Events */
 
@@ -588,6 +680,22 @@ static void fatal(const char *fmt, ...)
 	ev_str("message", message);
 	ev_end();
 	exit(1);
+}
+
+static void emit_error(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+
+/* Non-fatal error the client may be waiting on, such as a failed pool. */
+static void emit_error(const char *fmt, ...)
+{
+	char message[512];
+	va_list args;
+	va_start(args, fmt);
+	vsnprintf(message, sizeof(message), fmt, args);
+	va_end(args);
+	log_msg("%s", message);
+	ev_begin("error");
+	ev_str("message", message);
+	ev_end();
 }
 
 static void display_failed(void)
@@ -820,6 +928,9 @@ static void output_destroy(struct output *output)
 			break;
 		}
 	}
+	probe_output_removed(output);
+	if (output->vpointer)
+		zwlr_virtual_pointer_v1_destroy(output->vpointer);
 	if (output->xdg)
 		zxdg_output_v1_destroy(output->xdg);
 	if (wl_output_get_version(output->wl) >= WL_OUTPUT_RELEASE_SINCE_VERSION)
@@ -1313,6 +1424,10 @@ static void pointer_enter(void *data, struct wl_pointer *pointer, uint32_t seria
 			  struct wl_surface *wl, wl_fixed_t x, wl_fixed_t y)
 {
 	host.pointer_serial = serial;
+	if (probe_pointer_enter(wl, x, y)) {
+		host.pointer_focus = NULL;
+		return;
+	}
 	host.pointer_focus = surface_from_wl(wl);
 	host.pointer_x = wl_fixed_to_double(x);
 	host.pointer_y = wl_fixed_to_double(y);
@@ -1480,6 +1595,7 @@ static void emit_key(uint32_t keycode, bool pressed, bool repeat)
 	ev_bool("repeat", repeat);
 	ev_str("keysym", keysym);
 	ev_int("sym", sym);
+	ev_int("code", (long long)keycode - 8);
 	ev_strn("text", text, (size_t)text_len);
 	ev_key("mods");
 	static const struct {
@@ -1530,6 +1646,7 @@ static void keyboard_keymap(void *data, struct wl_keyboard *keyboard, uint32_t f
 	xkb_keymap_unref(host.keymap);
 	host.keymap = keymap;
 	host.xkb_state = state;
+	vk_keymap_changed();
 }
 
 static void keyboard_enter(void *data, struct wl_keyboard *keyboard, uint32_t serial,
@@ -2234,6 +2351,8 @@ static void seat_release(void)
 {
 	if (!host.seat)
 		return;
+	vk_destroy();
+	vp_destroy_all();
 	pointer_release();
 	keyboard_release();
 	dc_device_destroy();
@@ -2296,6 +2415,23 @@ static void registry_global(void *data, struct wl_registry *registry, uint32_t n
 		host.dc_wlr_global = name;
 		host.dc_wlr_version = version;
 		dc_manager_bind();
+	} else if (strcmp(interface, zwp_virtual_keyboard_manager_v1_interface.name) == 0) {
+		if (host.vk_manager)
+			return;
+		host.vk_manager =
+			bind_global(name, &zwp_virtual_keyboard_manager_v1_interface, version, 1);
+		host.vk_manager_global = name;
+	} else if (strcmp(interface, zwlr_virtual_pointer_manager_v1_interface.name) == 0) {
+		if (host.vp_manager)
+			return;
+		host.vp_manager =
+			bind_global(name, &zwlr_virtual_pointer_manager_v1_interface, version, 2);
+		host.vp_manager_global = name;
+	} else if (strcmp(interface, zwlr_screencopy_manager_v1_interface.name) == 0) {
+		if (host.screencopy)
+			return;
+		host.screencopy = bind_global(name, &zwlr_screencopy_manager_v1_interface, version, 3);
+		host.screencopy_global = name;
 	}
 }
 
@@ -2350,6 +2486,18 @@ static void registry_global_remove(void *data, struct wl_registry *registry, uin
 			dc_manager_destroy();
 			dc_manager_bind();
 		}
+	} else if (name == host.vk_manager_global && host.vk_manager) {
+		vk_destroy();
+		zwp_virtual_keyboard_manager_v1_destroy(host.vk_manager);
+		host.vk_manager = NULL;
+	} else if (name == host.vp_manager_global && host.vp_manager) {
+		vp_destroy_all();
+		zwlr_virtual_pointer_manager_v1_destroy(host.vp_manager);
+		host.vp_manager = NULL;
+	} else if (name == host.screencopy_global && host.screencopy) {
+		/* Frames in flight are independent objects and finish or fail. */
+		zwlr_screencopy_manager_v1_destroy(host.screencopy);
+		host.screencopy = NULL;
 	}
 }
 
@@ -2357,6 +2505,1093 @@ static const struct wl_registry_listener registry_listener = {
 	.global = registry_global,
 	.global_remove = registry_global_remove,
 };
+
+/* Shared helpers for input injection, capture and probing */
+
+static uint32_t now_ms(void)
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint32_t)((uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000);
+}
+
+/* Arms a one-shot timer; 0 disarms it. */
+static void timer_arm(int fd, long ms)
+{
+	struct itimerspec spec = { .it_value = { ms / 1000, ms % 1000 * 1000000L } };
+	timerfd_settime(fd, 0, &spec, NULL);
+}
+
+static bool write_all(int fd, const void *data, size_t len)
+{
+	const char *ptr = data;
+	while (len > 0) {
+		ssize_t written = write(fd, ptr, len);
+		if (written < 0 && errno == EINTR)
+			continue;
+		if (written <= 0)
+			return false;
+		ptr += written;
+		len -= (size_t)written;
+	}
+	return true;
+}
+
+/* Returns a zero-filled memfd of `size` bytes, or -1. */
+static int memfd_new(const char *name, size_t size)
+{
+	int fd = memfd_create(name, MFD_CLOEXEC);
+	if (fd < 0) {
+		log_msg("memfd_create: %s", strerror(errno));
+		return -1;
+	}
+	if (ftruncate(fd, (off_t)size) < 0) {
+		log_msg("ftruncate: %s", strerror(errno));
+		close(fd);
+		return -1;
+	}
+	return fd;
+}
+
+/* A fully transparent ARGB8888 buffer. */
+static struct wl_buffer *transparent_buffer_new(int32_t width, int32_t height)
+{
+	if (!host.shm || width < 1 || height < 1 || (int64_t)width * height * 4 > INT32_MAX)
+		return NULL;
+	int32_t size = width * height * 4;
+	int fd = memfd_new("overlay-transparent", (size_t)size);
+	if (fd < 0)
+		return NULL;
+	struct wl_shm_pool *pool = wl_shm_create_pool(host.shm, fd, size);
+	struct wl_buffer *buffer = wl_shm_pool_create_buffer(pool, 0, width, height, width * 4,
+							     WL_SHM_FORMAT_ARGB8888);
+	wl_shm_pool_destroy(pool);
+	close(fd);
+	return buffer;
+}
+
+static bool bit_test(const unsigned long *bits, unsigned bit)
+{
+	return bits[bit / BITS_PER_LONG] >> (bit % BITS_PER_LONG) & 1;
+}
+
+static void bit_assign(unsigned long *bits, unsigned bit, bool value)
+{
+	unsigned long mask = 1UL << (bit % BITS_PER_LONG);
+	if (value)
+		bits[bit / BITS_PER_LONG] |= mask;
+	else
+		bits[bit / BITS_PER_LONG] &= ~mask;
+}
+
+/* Evdev. Devices are never grabbed: the compositor keeps receiving every
+ * event, the host only observes them. */
+
+static void emit_input_key(unsigned code, int32_t value)
+{
+	ev_begin("input");
+	ev_str("kind", "key");
+	ev_int("code", code);
+	ev_int("value", value);
+	ev_end();
+}
+
+static void emit_input_wheel(int32_t value, bool horizontal)
+{
+	ev_begin("input");
+	ev_str("kind", "wheel");
+	ev_int("value", value);
+	ev_bool("horizontal", horizontal);
+	ev_end();
+}
+
+static void evdev_report_count(bool always)
+{
+	int count = wl_list_length(&host.evdev_devices);
+	if (!always && count == host.evdev_reported)
+		return;
+	host.evdev_reported = count;
+	ev_begin("evdev");
+	ev_int("devices", count);
+	ev_end();
+}
+
+struct evdev_caps {
+	unsigned long types[BITS_LONGS(EV_CNT)];
+	unsigned long keys[BITS_LONGS(KEY_CNT)];
+	unsigned long rels[BITS_LONGS(REL_CNT)];
+};
+
+/* Keyboards (letter keys), mice (left button) and wheels. */
+static bool evdev_caps_wanted(const struct evdev_caps *caps)
+{
+	return (bit_test(caps->types, EV_KEY) &&
+		(bit_test(caps->keys, KEY_A) || bit_test(caps->keys, BTN_LEFT))) ||
+	       (bit_test(caps->types, EV_REL) && bit_test(caps->rels, REL_WHEEL));
+}
+
+static bool evdev_is_wanted(int fd)
+{
+	struct evdev_caps caps = { 0 };
+	if (ioctl(fd, EVIOCGBIT(0, sizeof(caps.types)), caps.types) < 0)
+		return false;
+	ioctl(fd, EVIOCGBIT(EV_KEY, sizeof(caps.keys)), caps.keys);
+	ioctl(fd, EVIOCGBIT(EV_REL, sizeof(caps.rels)), caps.rels);
+	return evdev_caps_wanted(&caps);
+}
+
+/* Reads a sysfs capability bitmap: hex longs separated by spaces, most
+ * significant first. */
+static bool sysfs_read_bits(const char *name, const char *cap, unsigned long *bits, size_t longs)
+{
+	char path[PATH_MAX], text[1024];
+	snprintf(path, sizeof(path), "/sys/class/input/%s/device/capabilities/%s", name, cap);
+	int fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0)
+		return false;
+	ssize_t len = read(fd, text, sizeof(text) - 1);
+	close(fd);
+	if (len <= 0)
+		return false;
+	text[len] = '\0';
+	char *words[64], *save = NULL;
+	size_t count = 0;
+	for (char *word = strtok_r(text, " \n", &save); word && count < ARRAY_LEN(words);
+	     word = strtok_r(NULL, " \n", &save))
+		words[count++] = word;
+	for (size_t i = 0; i < count && i < longs; i++)
+		bits[i] = strtoul(words[count - 1 - i], NULL, 16);
+	return true;
+}
+
+/* Closing an evdev fd waits for an RCU grace period, about 10-30 ms, so
+ * devices whose sysfs capabilities rule them out are not opened at all. When
+ * sysfs is unavailable the device is opened and checked with ioctls. */
+static bool evdev_maybe_wanted(const char *name)
+{
+	struct evdev_caps caps = { 0 };
+	if (!sysfs_read_bits(name, "ev", caps.types, ARRAY_LEN(caps.types)) ||
+	    !sysfs_read_bits(name, "key", caps.keys, ARRAY_LEN(caps.keys)) ||
+	    !sysfs_read_bits(name, "rel", caps.rels, ARRAY_LEN(caps.rels)))
+		return true;
+	return evdev_caps_wanted(&caps);
+}
+
+static struct evdev_device *evdev_find(const char *name)
+{
+	struct evdev_device *device;
+	wl_list_for_each(device, &host.evdev_devices, link) {
+		if (strcmp(device->name, name) == 0)
+			return device;
+	}
+	return NULL;
+}
+
+/* Records a device's key state, reporting the first press and the last
+ * release across devices. */
+static void evdev_set_key(struct evdev_device *device, unsigned code, bool down)
+{
+	if (down == bit_test(device->keys, code))
+		return;
+	bit_assign(device->keys, code, down);
+	if (down && host.evdev_key_holders[code]++ == 0)
+		emit_input_key(code, 1);
+	else if (!down && --host.evdev_key_holders[code] == 0)
+		emit_input_key(code, 0);
+}
+
+static void evdev_close(struct evdev_device *device)
+{
+	close(device->fd);
+	wl_list_remove(&device->link);
+	free(device->name);
+	free(device);
+}
+
+/* Closes a device that went away, releasing its held keys so that none stays
+ * pressed for the client. */
+static void evdev_drop(struct evdev_device *device)
+{
+	for (unsigned code = 0; code < KEY_CNT; code++)
+		evdev_set_key(device, code, false);
+	evdev_close(device);
+}
+
+enum evdev_open_result { EVDEV_OPENED, EVDEV_SKIPPED, EVDEV_DENIED };
+
+static enum evdev_open_result evdev_open(const char *name)
+{
+	if (strncmp(name, "event", 5) != 0 || strchr(name, '/'))
+		return EVDEV_SKIPPED;
+	char path[PATH_MAX];
+	snprintf(path, sizeof(path), EVDEV_DIR "/%s", name);
+	struct stat st;
+	struct evdev_device *existing = evdev_find(name);
+	if (existing && stat(path, &st) == 0 && st.st_rdev == existing->rdev)
+		return EVDEV_OPENED;
+	if (!evdev_maybe_wanted(name))
+		return EVDEV_SKIPPED;
+	int fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+	if (fd < 0)
+		return errno == EACCES || errno == EPERM ? EVDEV_DENIED : EVDEV_SKIPPED;
+	if (fstat(fd, &st) < 0 || !S_ISCHR(st.st_mode) || !evdev_is_wanted(fd)) {
+		close(fd);
+		return EVDEV_SKIPPED;
+	}
+	/* The node was replaced by another device with the same name. */
+	if (existing)
+		evdev_drop(existing);
+	struct evdev_device *device = xcalloc(1, sizeof(*device));
+	device->fd = fd;
+	device->rdev = st.st_rdev;
+	device->name = xstrdup(name);
+	/* Keys already down produce a release without a press, never a stuck key. */
+	ioctl(fd, EVIOCGKEY(sizeof(device->keys)), device->keys);
+	for (unsigned code = 0; code < KEY_CNT; code++)
+		host.evdev_key_holders[code] += bit_test(device->keys, code);
+	wl_list_insert(host.evdev_devices.prev, &device->link);
+	return EVDEV_OPENED;
+}
+
+/* Opens every wanted device not open yet. Returns whether any was denied. */
+static bool evdev_scan(void)
+{
+	DIR *dir = opendir(EVDEV_DIR);
+	if (!dir) {
+		log_msg("evdev: cannot open " EVDEV_DIR ": %s", strerror(errno));
+		return false;
+	}
+	bool denied = false;
+	struct dirent *entry;
+	while ((entry = readdir(dir)))
+		denied |= evdev_open(entry->d_name) == EVDEV_DENIED;
+	closedir(dir);
+	return denied;
+}
+
+/* After SYN_DROPPED the kernel discarded events; the current key state is
+ * fetched and the differences reported as presses and releases. */
+static void evdev_resync(struct evdev_device *device)
+{
+	unsigned long keys[BITS_LONGS(KEY_CNT)] = { 0 };
+	if (ioctl(device->fd, EVIOCGKEY(sizeof(keys)), keys) < 0)
+		return;
+	for (unsigned code = 0; code < KEY_CNT; code++)
+		evdev_set_key(device, code, bit_test(keys, code));
+}
+
+static void evdev_handle(struct evdev_device *device, const struct input_event *event)
+{
+	if (event->type == EV_SYN) {
+		if (event->code == SYN_DROPPED) {
+			device->dropping = true;
+		} else if (event->code == SYN_REPORT && device->dropping) {
+			device->dropping = false;
+			evdev_resync(device);
+		}
+		return;
+	}
+	if (device->dropping)
+		return;
+	if (event->type == EV_KEY && event->code < KEY_CNT && event->value >= 0 &&
+	    event->value <= 2) {
+		if (event->value == 2) {
+			if (bit_test(device->keys, event->code))
+				emit_input_key(event->code, 2);
+		} else {
+			evdev_set_key(device, event->code, event->value == 1);
+		}
+	} else if (event->type == EV_REL && (event->code == REL_WHEEL || event->code == REL_HWHEEL) &&
+		   event->value != 0) {
+		emit_input_wheel(event->value, event->code == REL_HWHEEL);
+	}
+}
+
+static void evdev_read(struct evdev_device *device)
+{
+	struct input_event events[64];
+	for (;;) {
+		ssize_t len = read(device->fd, events, sizeof(events));
+		if (len < 0 && errno == EINTR)
+			continue;
+		if (len < 0 && errno == EAGAIN)
+			return;
+		if (len <= 0) {
+			if (len < 0 && errno != ENODEV)
+				log_msg("evdev %s: %s", device->name, strerror(errno));
+			evdev_drop(device);
+			evdev_report_count(false);
+			return;
+		}
+		size_t count = (size_t)len / sizeof(events[0]);
+		for (size_t i = 0; i < count; i++)
+			evdev_handle(device, &events[i]);
+	}
+}
+
+static void evdev_inotify_read(void)
+{
+	char buf[4096] __attribute__((aligned(__alignof__(struct inotify_event))));
+	bool rescan = false;
+	for (;;) {
+		ssize_t len = read(host.evdev_inotify_fd, buf, sizeof(buf));
+		if (len < 0 && errno == EINTR)
+			continue;
+		if (len <= 0)
+			break;
+		for (char *ptr = buf; ptr < buf + len;) {
+			const struct inotify_event *event = (const struct inotify_event *)ptr;
+			ptr += sizeof(*event) + event->len;
+			if (event->mask & IN_Q_OVERFLOW)
+				rescan = true;
+			if (event->len == 0)
+				continue;
+			if (event->mask & IN_DELETE) {
+				struct evdev_device *device = evdev_find(event->name);
+				if (device)
+					evdev_drop(device);
+			} else {
+				/* udev sets permissions after the node is created, so
+				 * IN_ATTRIB retries a device denied on IN_CREATE. */
+				evdev_open(event->name);
+			}
+		}
+	}
+	if (rescan)
+		evdev_scan();
+	evdev_report_count(false);
+}
+
+static void evdev_stop(void)
+{
+	struct evdev_device *device, *tmp;
+	wl_list_for_each_safe(device, tmp, &host.evdev_devices, link)
+		evdev_close(device);
+	memset(host.evdev_key_holders, 0, sizeof(host.evdev_key_holders));
+	if (host.evdev_inotify_fd >= 0)
+		close(host.evdev_inotify_fd);
+	host.evdev_inotify_fd = -1;
+	host.evdev_on = false;
+}
+
+static void cmd_evdev(char **argv, size_t argc)
+{
+	if (strcmp(argv[1], "off") == 0) {
+		bool was_on = host.evdev_on;
+		evdev_stop();
+		if (was_on)
+			evdev_report_count(false);
+		return;
+	}
+	if (strcmp(argv[1], "on") != 0) {
+		log_msg("evdev: expected on or off, got %.64s", argv[1]);
+		return;
+	}
+	host.evdev_on = true;
+	if (host.evdev_inotify_fd < 0) {
+		host.evdev_inotify_fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+		if (host.evdev_inotify_fd < 0) {
+			log_msg("evdev: inotify_init1: %s; devices plugged in later are missed",
+				strerror(errno));
+		} else if (inotify_add_watch(host.evdev_inotify_fd, EVDEV_DIR,
+					     IN_CREATE | IN_ATTRIB | IN_DELETE) < 0) {
+			log_msg("evdev: cannot watch " EVDEV_DIR ": %s", strerror(errno));
+			close(host.evdev_inotify_fd);
+			host.evdev_inotify_fd = -1;
+		}
+	}
+	bool denied = evdev_scan();
+	evdev_report_count(true);
+	if (wl_list_empty(&host.evdev_devices))
+		emit_error("evdev: cannot read any keyboard or mouse in " EVDEV_DIR "%s; the user "
+			   "must be in the input group",
+			   denied ? " (permission denied)" : "");
+}
+
+/* Virtual keyboard */
+
+/* Uploads the keymap to the virtual keyboard, unless it is already in use,
+ * and resets the virtual keyboard's modifier state. */
+static bool vk_upload(struct xkb_keymap *keymap)
+{
+	char *text = xkb_keymap_get_as_string(keymap, XKB_KEYMAP_FORMAT_TEXT_V1);
+	if (!text) {
+		log_msg("vkey: cannot serialize the keymap");
+		return false;
+	}
+	if (host.vk_keymap_text && strcmp(text, host.vk_keymap_text) == 0) {
+		free(text);
+		return true;
+	}
+	size_t size = strlen(text) + 1;
+	struct xkb_state *state = xkb_state_new(keymap);
+	int fd = memfd_new("overlay-keymap", 0);
+	if (!state || fd < 0 || !write_all(fd, text, size)) {
+		log_msg("vkey: cannot upload the keymap");
+		if (fd >= 0)
+			close(fd);
+		xkb_state_unref(state);
+		free(text);
+		return false;
+	}
+	/* libwayland duplicates the fd while sending the request. */
+	zwp_virtual_keyboard_v1_keymap(host.vk, WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1, fd,
+				       (uint32_t)size);
+	close(fd);
+	zwp_virtual_keyboard_v1_modifiers(host.vk, 0, 0, 0, 0);
+	xkb_state_unref(host.vk_state);
+	host.vk_state = state;
+	free(host.vk_keymap_text);
+	host.vk_keymap_text = text;
+	return true;
+}
+
+static void vk_destroy(void)
+{
+	if (host.vk)
+		zwp_virtual_keyboard_v1_destroy(host.vk);
+	host.vk = NULL;
+	xkb_state_unref(host.vk_state);
+	host.vk_state = NULL;
+	free(host.vk_keymap_text);
+	host.vk_keymap_text = NULL;
+	host.vk_default_keymap = false;
+}
+
+/* Creates the virtual keyboard with the seat keymap, or the default keymap
+ * when the seat has not sent one. The keymap is set before any key, which
+ * the protocol requires. */
+static bool vk_ensure(void)
+{
+	if (host.vk)
+		return true;
+	if (!host.vk_manager) {
+		log_msg("vkey: zwp_virtual_keyboard_manager_v1 is unavailable");
+		return false;
+	}
+	if (!host.seat) {
+		log_msg("vkey: no seat");
+		return false;
+	}
+	struct xkb_keymap *keymap =
+		host.keymap ? xkb_keymap_ref(host.keymap)
+			    : xkb_keymap_new_from_names(host.xkb_context, NULL,
+							XKB_KEYMAP_COMPILE_NO_FLAGS);
+	if (!keymap) {
+		log_msg("vkey: cannot compile a default keymap");
+		return false;
+	}
+	host.vk = zwp_virtual_keyboard_manager_v1_create_virtual_keyboard(host.vk_manager, host.seat);
+	host.vk_default_keymap = !host.keymap;
+	bool uploaded = vk_upload(keymap);
+	xkb_keymap_unref(keymap);
+	if (!uploaded)
+		vk_destroy();
+	return uploaded;
+}
+
+/* Only the first seat keymap replaces a default one. Later keymap events are
+ * not followed: niri broadcasts a virtual keyboard's keymap to the seat
+ * whenever it types, so following them uploads our own keymap back and forth
+ * between two serializations without end. */
+static void vk_keymap_changed(void)
+{
+	if (!host.vk || !host.vk_default_keymap || !host.keymap)
+		return;
+	host.vk_default_keymap = false;
+	vk_upload(host.keymap);
+}
+
+static void cmd_vkey(char **argv, size_t argc)
+{
+	uint32_t code, state;
+	if (!parse_u32(argv[1], &code) || code >= KEY_CNT || !parse_u32(argv[2], &state) ||
+	    state > 1) {
+		log_msg("vkey: invalid arguments");
+		return;
+	}
+	if (!vk_ensure())
+		return;
+	zwp_virtual_keyboard_v1_key(host.vk, now_ms(), code,
+				    state ? WL_KEYBOARD_KEY_STATE_PRESSED
+					  : WL_KEYBOARD_KEY_STATE_RELEASED);
+	enum xkb_state_component changed =
+		xkb_state_update_key(host.vk_state, code + 8, state ? XKB_KEY_DOWN : XKB_KEY_UP);
+	if (changed)
+		zwp_virtual_keyboard_v1_modifiers(
+			host.vk, xkb_state_serialize_mods(host.vk_state, XKB_STATE_MODS_DEPRESSED),
+			xkb_state_serialize_mods(host.vk_state, XKB_STATE_MODS_LATCHED),
+			xkb_state_serialize_mods(host.vk_state, XKB_STATE_MODS_LOCKED),
+			xkb_state_serialize_layout(host.vk_state, XKB_STATE_LAYOUT_EFFECTIVE));
+	wl_display_flush(host.display);
+}
+
+/* Virtual pointer */
+
+static void vp_destroy_all(void)
+{
+	struct output *output;
+	wl_list_for_each(output, &host.outputs, link) {
+		if (output->vpointer)
+			zwlr_virtual_pointer_v1_destroy(output->vpointer);
+		output->vpointer = NULL;
+	}
+	if (host.vpointer)
+		zwlr_virtual_pointer_v1_destroy(host.vpointer);
+	host.vpointer = NULL;
+}
+
+/* The output containing the point, else the nearest one. */
+static struct output *output_at(double x, double y)
+{
+	struct output *output, *best = NULL;
+	double best_distance = 0;
+	wl_list_for_each(output, &host.outputs, link) {
+		struct rect r = output_logical(output);
+		if (!output->done || r.width <= 0 || r.height <= 0)
+			continue;
+		double right = (double)r.x + r.width, bottom = (double)r.y + r.height;
+		double dx = x < r.x ? r.x - x : x >= right ? x - right + 1 : 0;
+		double dy = y < r.y ? r.y - y : y >= bottom ? y - bottom + 1 : 0;
+		double distance = dx * dx + dy * dy;
+		if (!best || distance < best_distance) {
+			best = output;
+			best_distance = distance;
+		}
+	}
+	return best;
+}
+
+static void cmd_warp(char **argv, size_t argc)
+{
+	double x, y;
+	if (!parse_double(argv[1], &x) || !parse_double(argv[2], &y)) {
+		log_msg("warp: invalid position");
+		return;
+	}
+	if (!host.vp_manager) {
+		log_msg("warp: zwlr_virtual_pointer_manager_v1 is unavailable");
+		return;
+	}
+	if (!host.seat) {
+		log_msg("warp: no seat");
+		return;
+	}
+	struct zwlr_virtual_pointer_v1 *pointer;
+	struct rect extent = { 0 };
+	if (zwlr_virtual_pointer_manager_v1_get_version(host.vp_manager) >=
+	    ZWLR_VIRTUAL_POINTER_MANAGER_V1_CREATE_VIRTUAL_POINTER_WITH_OUTPUT_SINCE_VERSION) {
+		struct output *output = output_at(x, y);
+		if (!output) {
+			log_msg("warp: no output");
+			return;
+		}
+		if (!output->vpointer)
+			output->vpointer = zwlr_virtual_pointer_manager_v1_create_virtual_pointer_with_output(
+				host.vp_manager, host.seat, output->wl);
+		pointer = output->vpointer;
+		extent = output_logical(output);
+	} else {
+		/* Without an output the extent maps onto the whole layout. */
+		bool first = true;
+		int64_t right = 0, bottom = 0;
+		struct output *output;
+		wl_list_for_each(output, &host.outputs, link) {
+			struct rect r = output_logical(output);
+			if (!output->done || r.width <= 0 || r.height <= 0)
+				continue;
+			if (first || r.x < extent.x)
+				extent.x = r.x;
+			if (first || r.y < extent.y)
+				extent.y = r.y;
+			if (first || (int64_t)r.x + r.width > right)
+				right = (int64_t)r.x + r.width;
+			if (first || (int64_t)r.y + r.height > bottom)
+				bottom = (int64_t)r.y + r.height;
+			first = false;
+		}
+		if (first) {
+			log_msg("warp: no output");
+			return;
+		}
+		extent.width = (int32_t)(right - extent.x);
+		extent.height = (int32_t)(bottom - extent.y);
+		if (!host.vpointer)
+			host.vpointer = zwlr_virtual_pointer_manager_v1_create_virtual_pointer(
+				host.vp_manager, host.seat);
+		pointer = host.vpointer;
+	}
+	int64_t px = floor_i32(x + 0.5) - (int64_t)extent.x;
+	int64_t py = floor_i32(y + 0.5) - (int64_t)extent.y;
+	px = px < 0 ? 0 : px >= extent.width ? extent.width - 1 : px;
+	py = py < 0 ? 0 : py >= extent.height ? extent.height - 1 : py;
+	zwlr_virtual_pointer_v1_motion_absolute(pointer, now_ms(), (uint32_t)px, (uint32_t)py,
+						(uint32_t)extent.width, (uint32_t)extent.height);
+	zwlr_virtual_pointer_v1_frame(pointer);
+	wl_display_flush(host.display);
+}
+
+/* Screencopy */
+
+static void capture_free(struct capture *capture)
+{
+	if (capture->frame)
+		zwlr_screencopy_frame_v1_destroy(capture->frame);
+	if (capture->buffer)
+		wl_buffer_destroy(capture->buffer);
+	if (capture->data)
+		munmap(capture->data, capture->size);
+	wl_list_remove(&capture->link);
+	free(capture->id);
+	free(capture->path);
+	free(capture);
+}
+
+static void emit_capture_error(const char *id, const char *fmt, ...)
+	__attribute__((format(printf, 2, 3)));
+
+static void emit_capture_error(const char *id, const char *fmt, ...)
+{
+	char message[512];
+	va_list args;
+	va_start(args, fmt);
+	vsnprintf(message, sizeof(message), fmt, args);
+	va_end(args);
+	log_msg("capture %s: %s", id, message);
+	ev_begin("capture");
+	ev_str("id", id);
+	ev_str("error", message);
+	ev_end();
+}
+
+static bool capture_format_supported(uint32_t format)
+{
+	return format == WL_SHM_FORMAT_ARGB8888 || format == WL_SHM_FORMAT_XRGB8888 ||
+	       format == WL_SHM_FORMAT_ABGR8888 || format == WL_SHM_FORMAT_XBGR8888;
+}
+
+static void capture_copy(struct capture *capture)
+{
+	if (!capture->has_shm) {
+		emit_capture_error(capture->id, "the compositor offers no wl_shm buffer");
+		capture_free(capture);
+		return;
+	}
+	if (!capture_format_supported(capture->format)) {
+		emit_capture_error(capture->id, "unsupported pixel format 0x%08x", capture->format);
+		capture_free(capture);
+		return;
+	}
+	if (!host.shm || capture->width == 0 || capture->height == 0 ||
+	    capture->width > INT32_MAX / 4 || capture->stride < capture->width * 4 ||
+	    (uint64_t)capture->stride * capture->height > INT32_MAX) {
+		emit_capture_error(capture->id, "invalid buffer %ux%u with stride %u",
+				   capture->width, capture->height, capture->stride);
+		capture_free(capture);
+		return;
+	}
+	capture->size = (size_t)capture->stride * capture->height;
+	int fd = memfd_new("overlay-capture", capture->size);
+	void *data = fd < 0 ? MAP_FAILED
+			    : mmap(NULL, capture->size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+	if (data == MAP_FAILED) {
+		if (fd >= 0)
+			close(fd);
+		emit_capture_error(capture->id, "cannot allocate the buffer");
+		capture_free(capture);
+		return;
+	}
+	capture->data = data;
+	struct wl_shm_pool *pool = wl_shm_create_pool(host.shm, fd, (int32_t)capture->size);
+	capture->buffer = wl_shm_pool_create_buffer(pool, 0, (int32_t)capture->width,
+						    (int32_t)capture->height,
+						    (int32_t)capture->stride, capture->format);
+	wl_shm_pool_destroy(pool);
+	close(fd);
+	zwlr_screencopy_frame_v1_copy(capture->frame, capture->buffer);
+}
+
+static void capture_frame_buffer(void *data, struct zwlr_screencopy_frame_v1 *frame,
+				 uint32_t format, uint32_t width, uint32_t height, uint32_t stride)
+{
+	struct capture *capture = data;
+	capture->has_shm = true;
+	capture->format = format;
+	capture->width = width;
+	capture->height = height;
+	capture->stride = stride;
+	if (zwlr_screencopy_frame_v1_get_version(frame) <
+	    ZWLR_SCREENCOPY_FRAME_V1_BUFFER_DONE_SINCE_VERSION)
+		capture_copy(capture);
+}
+
+static void capture_frame_flags(void *data, struct zwlr_screencopy_frame_v1 *frame, uint32_t flags)
+{
+	struct capture *capture = data;
+	capture->flags = flags;
+}
+
+/* Size of the captured image as shown, which differs from the buffer when
+ * the output is rotated. */
+static void capture_image_size(const struct capture *capture, uint32_t *width, uint32_t *height)
+{
+	bool rotated = capture->transform & 1;
+	*width = rotated ? capture->height : capture->width;
+	*height = rotated ? capture->width : capture->height;
+}
+
+/* Writes BGRA rows of the image as shown, top row first, with opaque alpha.
+ * Screencopy buffers are in the output's buffer orientation, so the output
+ * transform is applied here. */
+static bool capture_write(const struct capture *capture)
+{
+	/* A new file only: an existing path may be a symlink or a FIFO planted in
+	 * a shared directory. */
+	int fd = open(capture->path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
+	if (fd < 0)
+		return false;
+	bool swap = capture->format == WL_SHM_FORMAT_ABGR8888 ||
+		    capture->format == WL_SHM_FORMAT_XBGR8888;
+	bool invert = capture->flags & ZWLR_SCREENCOPY_FRAME_V1_FLAGS_Y_INVERT;
+	bool flipped = capture->transform & WL_OUTPUT_TRANSFORM_FLIPPED;
+	int32_t rotation = capture->transform & 3;
+	uint32_t width, height;
+	capture_image_size(capture, &width, &height);
+	uint32_t max_x = capture->width - 1, max_y = capture->height - 1;
+	size_t row_len = (size_t)width * 4;
+	unsigned char *row = xrealloc(NULL, row_len);
+	bool ok = true;
+	for (uint32_t y = 0; y < height && ok; y++) {
+		for (uint32_t x = 0; x < width; x++) {
+			uint32_t bx, by;
+			switch (rotation) {
+			case WL_OUTPUT_TRANSFORM_90: bx = y, by = max_y - x; break;
+			case WL_OUTPUT_TRANSFORM_180: bx = max_x - x, by = max_y - y; break;
+			case WL_OUTPUT_TRANSFORM_270: bx = max_x - y, by = x; break;
+			default: bx = x, by = y; break;
+			}
+			if (flipped)
+				bx = max_x - bx;
+			if (invert)
+				by = max_y - by;
+			const unsigned char *src = (const unsigned char *)capture->data +
+						   (size_t)by * capture->stride + (size_t)bx * 4;
+			/* Little-endian xRGB8888 is B, G, R, x in memory; xBGR8888 is R, G, B, x. */
+			unsigned char *dst = row + (size_t)x * 4;
+			dst[0] = src[swap ? 2 : 0];
+			dst[1] = src[1];
+			dst[2] = src[swap ? 0 : 2];
+			dst[3] = 0xff;
+		}
+		ok = write_all(fd, row, row_len);
+	}
+	free(row);
+	return close(fd) == 0 && ok;
+}
+
+static void capture_frame_ready(void *data, struct zwlr_screencopy_frame_v1 *frame,
+				uint32_t tv_sec_hi, uint32_t tv_sec_lo, uint32_t tv_nsec)
+{
+	struct capture *capture = data;
+	if (!capture_write(capture)) {
+		emit_capture_error(capture->id, "cannot write %s: %s", capture->path, strerror(errno));
+	} else {
+		uint32_t width, height;
+		capture_image_size(capture, &width, &height);
+		ev_begin("capture");
+		ev_str("id", capture->id);
+		ev_int("width", width);
+		ev_int("height", height);
+		ev_end();
+	}
+	capture_free(capture);
+}
+
+static void capture_frame_failed(void *data, struct zwlr_screencopy_frame_v1 *frame)
+{
+	struct capture *capture = data;
+	emit_capture_error(capture->id, "the compositor failed to capture the output");
+	capture_free(capture);
+}
+
+static void capture_frame_damage(void *data, struct zwlr_screencopy_frame_v1 *frame, uint32_t x,
+				 uint32_t y, uint32_t width, uint32_t height)
+{
+}
+
+static void capture_frame_linux_dmabuf(void *data, struct zwlr_screencopy_frame_v1 *frame,
+				       uint32_t format, uint32_t width, uint32_t height)
+{
+}
+
+static void capture_frame_buffer_done(void *data, struct zwlr_screencopy_frame_v1 *frame)
+{
+	capture_copy(data);
+}
+
+static const struct zwlr_screencopy_frame_v1_listener capture_frame_listener = {
+	.buffer = capture_frame_buffer,
+	.flags = capture_frame_flags,
+	.ready = capture_frame_ready,
+	.failed = capture_frame_failed,
+	.damage = capture_frame_damage,
+	.linux_dmabuf = capture_frame_linux_dmabuf,
+	.buffer_done = capture_frame_buffer_done,
+};
+
+static void cmd_capture(char **argv, size_t argc)
+{
+	const char *id = argv[1];
+	struct rect rect;
+	if (!parse_i32(argv[2], &rect.x) || !parse_i32(argv[3], &rect.y) ||
+	    !parse_i32(argv[4], &rect.width) || !parse_i32(argv[5], &rect.height) ||
+	    rect.width < 1 || rect.height < 1) {
+		emit_capture_error(id, "invalid rectangle");
+		return;
+	}
+	/* The path is the rest of the line and may contain spaces. */
+	for (size_t i = 6; i < argc - 1; i++)
+		argv[i][strlen(argv[i])] = ' ';
+	const char *path = argv[6];
+	if (!*path) {
+		emit_capture_error(id, "empty path");
+		return;
+	}
+	if (!host.screencopy) {
+		emit_capture_error(id, "zwlr_screencopy_manager_v1 is unavailable");
+		return;
+	}
+	struct output *output = output_for_rect(&rect);
+	if (!output) {
+		emit_capture_error(id, "no output");
+		return;
+	}
+	struct rect out = output_logical(output);
+	int64_t left = rect.x, top = rect.y;
+	int64_t right = left + rect.width, bottom = top + rect.height;
+	/* A clipped capture would not match the requested rectangle. */
+	if (left < out.x || top < out.y || right > (int64_t)out.x + out.width ||
+	    bottom > (int64_t)out.y + out.height) {
+		emit_capture_error(id, "the rectangle is not within one output");
+		return;
+	}
+	struct capture *capture = xcalloc(1, sizeof(*capture));
+	capture->id = xstrdup(id);
+	capture->path = xstrdup(path);
+	capture->transform = output->transform;
+	wl_list_insert(&host.captures, &capture->link);
+	capture->frame = zwlr_screencopy_manager_v1_capture_output_region(
+		host.screencopy, 0, output->wl, (int32_t)(left - out.x), (int32_t)(top - out.y),
+		(int32_t)(right - left), (int32_t)(bottom - top));
+	zwlr_screencopy_frame_v1_add_listener(capture->frame, &capture_frame_listener, capture);
+}
+
+/* Pointer probe. No protocol reports the pointer position to a client whose
+ * surface it is not over, so transparent surfaces covering every output are
+ * mapped until one receives wl_pointer.enter. */
+
+static void probe_surface_destroy(struct probe_surface *probe)
+{
+	if (probe->viewport)
+		wp_viewport_destroy(probe->viewport);
+	zwlr_layer_surface_v1_destroy(probe->layer);
+	wl_surface_destroy(probe->wl);
+	if (probe->buffer)
+		wl_buffer_destroy(probe->buffer);
+	wl_list_remove(&probe->link);
+	free(probe);
+}
+
+/* Answers every pending probe and removes the probe surfaces. */
+static void probe_finish(bool found, double x, double y)
+{
+	struct probe_surface *probe, *tmp;
+	wl_list_for_each_safe(probe, tmp, &host.probe_surfaces, link)
+		probe_surface_destroy(probe);
+	timer_arm(host.probe_fd, 0);
+	host.probe_mapped = false;
+	char **ids = host.probe_ids;
+	size_t count = host.probe_id_count;
+	host.probe_ids = NULL;
+	host.probe_id_count = 0;
+	for (size_t i = 0; i < count; i++) {
+		ev_begin("probe");
+		ev_str("id", ids[i]);
+		if (found) {
+			ev_num("x", x);
+			ev_num("y", y);
+		} else {
+			ev_str("x", NULL);
+			ev_str("y", NULL);
+		}
+		ev_end();
+		free(ids[i]);
+	}
+	free(ids);
+}
+
+/* niri does not move pointer focus to a surface mapped under a still pointer,
+ * so a zero relative motion makes it look up the surface again. The pointer
+ * does not move. */
+static void probe_nudge(void)
+{
+	if (!host.vp_manager || !host.seat)
+		return;
+	if (!host.vpointer)
+		host.vpointer =
+			zwlr_virtual_pointer_manager_v1_create_virtual_pointer(host.vp_manager, host.seat);
+	zwlr_virtual_pointer_v1_motion(host.vpointer, now_ms(), 0, 0);
+	zwlr_virtual_pointer_v1_frame(host.vpointer);
+}
+
+static void probe_check_mapped(void)
+{
+	if (host.probe_mapped)
+		return;
+	struct probe_surface *probe;
+	wl_list_for_each(probe, &host.probe_surfaces, link) {
+		if (!probe->committed)
+			return;
+	}
+	host.probe_mapped = true;
+	timer_arm(host.probe_fd, PROBE_ENTER_TIMEOUT_MS);
+	probe_nudge();
+}
+
+static void probe_layer_configure(void *data, struct zwlr_layer_surface_v1 *layer, uint32_t serial,
+				  uint32_t width, uint32_t height)
+{
+	struct probe_surface *probe = data;
+	zwlr_layer_surface_v1_ack_configure(layer, serial);
+	struct rect out = output_logical(probe->output);
+	int32_t w = width ? (int32_t)width : out.width;
+	int32_t h = height ? (int32_t)height : out.height;
+	if (w < 1 || h < 1)
+		w = h = 1;
+	struct wl_buffer *buffer;
+	if (probe->viewport) {
+		if (!host.probe_buffer)
+			host.probe_buffer = transparent_buffer_new(1, 1);
+		buffer = host.probe_buffer;
+		wp_viewport_set_destination(probe->viewport, w, h);
+	} else {
+		/* Without a viewport the buffer sets the surface size, which bounds
+		 * the input region. */
+		if (probe->buffer)
+			wl_buffer_destroy(probe->buffer);
+		probe->buffer = transparent_buffer_new(w, h);
+		buffer = probe->buffer;
+	}
+	if (buffer) {
+		wl_surface_attach(probe->wl, buffer, 0, 0);
+		wl_surface_damage(probe->wl, 0, 0, INT32_MAX, INT32_MAX);
+	}
+	wl_surface_commit(probe->wl);
+	probe->committed = true;
+	probe_check_mapped();
+}
+
+static void probe_layer_closed(void *data, struct zwlr_layer_surface_v1 *layer)
+{
+	probe_surface_destroy(data);
+	if (wl_list_empty(&host.probe_surfaces))
+		probe_finish(false, 0, 0);
+	else
+		probe_check_mapped();
+}
+
+static const struct zwlr_layer_surface_v1_listener probe_layer_listener = {
+	.configure = probe_layer_configure,
+	.closed = probe_layer_closed,
+};
+
+static void probe_begin(void)
+{
+	if (!host.layer_shell || !host.compositor || !host.shm || !host.pointer) {
+		probe_finish(false, 0, 0);
+		return;
+	}
+	struct output *output;
+	wl_list_for_each(output, &host.outputs, link) {
+		if (!output->done)
+			continue;
+		struct probe_surface *probe = xcalloc(1, sizeof(*probe));
+		probe->output = output;
+		probe->wl = wl_compositor_create_surface(host.compositor);
+		probe->layer = zwlr_layer_shell_v1_get_layer_surface(
+			host.layer_shell, probe->wl, output->wl, ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY,
+			PROBE_NAMESPACE);
+		zwlr_layer_surface_v1_add_listener(probe->layer, &probe_layer_listener, probe);
+		zwlr_layer_surface_v1_set_anchor(probe->layer, ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP |
+							       ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM |
+							       ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT |
+							       ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT);
+		zwlr_layer_surface_v1_set_size(probe->layer, 0, 0);
+		zwlr_layer_surface_v1_set_exclusive_zone(probe->layer, -1);
+		zwlr_layer_surface_v1_set_keyboard_interactivity(
+			probe->layer, ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_NONE);
+		if (host.viewporter)
+			probe->viewport = wp_viewporter_get_viewport(host.viewporter, probe->wl);
+		wl_surface_commit(probe->wl);
+		wl_list_insert(host.probe_surfaces.prev, &probe->link);
+	}
+	if (wl_list_empty(&host.probe_surfaces)) {
+		probe_finish(false, 0, 0);
+		return;
+	}
+	timer_arm(host.probe_fd, PROBE_MAP_TIMEOUT_MS);
+}
+
+static void probe_handle_timer(void)
+{
+	uint64_t expirations;
+	if (read(host.probe_fd, &expirations, sizeof(expirations)) != sizeof(expirations))
+		return;
+	if (host.probe_id_count > 0)
+		probe_finish(false, 0, 0);
+}
+
+static bool probe_pointer_enter(struct wl_surface *wl, wl_fixed_t x, wl_fixed_t y)
+{
+	if (!wl)
+		return false;
+	struct probe_surface *probe;
+	wl_list_for_each(probe, &host.probe_surfaces, link) {
+		if (probe->wl != wl)
+			continue;
+		struct rect out = output_logical(probe->output);
+		probe_finish(true, out.x + wl_fixed_to_double(x), out.y + wl_fixed_to_double(y));
+		return true;
+	}
+	return false;
+}
+
+static void probe_output_removed(struct output *output)
+{
+	struct probe_surface *probe, *tmp;
+	bool removed = false;
+	wl_list_for_each_safe(probe, tmp, &host.probe_surfaces, link) {
+		if (probe->output == output) {
+			probe_surface_destroy(probe);
+			removed = true;
+		}
+	}
+	if (!removed)
+		return;
+	if (wl_list_empty(&host.probe_surfaces))
+		probe_finish(false, 0, 0);
+	else
+		probe_check_mapped();
+}
+
+static void cmd_probe(char **argv, size_t argc)
+{
+	host.probe_ids = xrealloc(host.probe_ids, (host.probe_id_count + 1) * sizeof(*host.probe_ids));
+	host.probe_ids[host.probe_id_count++] = xstrdup(argv[1]);
+	/* A probe in progress answers this one too. */
+	if (host.probe_id_count == 1)
+		probe_begin();
+}
 
 /* Commands */
 
@@ -2575,22 +3810,6 @@ static void cmd_raise(char **argv, size_t argc)
 	surface_map(surface);
 }
 
-static void emit_error(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
-
-/* Non-fatal error the client may be waiting on, such as a failed pool. */
-static void emit_error(const char *fmt, ...)
-{
-	char message[512];
-	va_list args;
-	va_start(args, fmt);
-	vsnprintf(message, sizeof(message), fmt, args);
-	va_end(args);
-	log_msg("%s", message);
-	ev_begin("error");
-	ev_str("message", message);
-	ev_end();
-}
-
 static void cmd_buffers(char **argv, size_t argc)
 {
 	struct surface *surface = command_surface(argv[0], argv[1]);
@@ -2781,6 +4000,11 @@ static const struct command {
 	{ "activate", 2, 2, cmd_activate },
 	{ "clipboard-set", 2, 3, cmd_clipboard_set },
 	{ "clipboard-clear", 1, 1, cmd_clipboard_clear },
+	{ "evdev", 2, 2, cmd_evdev },
+	{ "vkey", 3, 3, cmd_vkey },
+	{ "warp", 3, 3, cmd_warp },
+	{ "capture", 7, 0, cmd_capture },
+	{ "probe", 2, 2, cmd_probe },
 	{ "quit", 1, 1, cmd_quit },
 };
 
@@ -2874,10 +4098,13 @@ static void emit_ready(void)
 	ev_bool("dataControl", host.dc_ext_global != 0 || host.dc_wlr_global != 0);
 	ev_bool("cursorShape", host.cursor_shape_manager != NULL);
 	ev_bool("viewporter", host.viewporter != NULL);
+	ev_bool("virtualKeyboard", host.vk_manager != NULL);
+	ev_bool("virtualPointer", host.vp_manager != NULL);
+	ev_bool("screencopy", host.screencopy != NULL);
 	ev_end();
 }
 
-enum poll_slot { SLOT_DISPLAY, SLOT_STDIN, SLOT_REPEAT, SLOT_FIXED_COUNT };
+enum poll_slot { SLOT_DISPLAY, SLOT_STDIN, SLOT_REPEAT, SLOT_PROBE, SLOT_INOTIFY, SLOT_FIXED_COUNT };
 
 static void run(void)
 {
@@ -2902,7 +4129,8 @@ static void run(void)
 		}
 
 		size_t count = SLOT_FIXED_COUNT + ARRAY_LEN(host.clip_reads) +
-			       (size_t)wl_list_length(&host.clip_writes);
+			       (size_t)wl_list_length(&host.clip_writes) +
+			       (size_t)wl_list_length(&host.evdev_devices);
 		if (count > pfds_cap) {
 			pfds_cap = count * 2;
 			pfds = xrealloc(pfds, pfds_cap * sizeof(*pfds));
@@ -2910,7 +4138,14 @@ static void run(void)
 		pfds[SLOT_DISPLAY] = (struct pollfd){ wl_display_get_fd(host.display), display_events, 0 };
 		pfds[SLOT_STDIN] = (struct pollfd){ STDIN_FILENO, POLLIN, 0 };
 		pfds[SLOT_REPEAT] = (struct pollfd){ host.repeat_fd, POLLIN, 0 };
+		pfds[SLOT_PROBE] = (struct pollfd){ host.probe_fd, POLLIN, 0 };
+		/* poll ignores negative fds, which stand for off. */
+		pfds[SLOT_INOTIFY] = (struct pollfd){ host.evdev_inotify_fd, POLLIN, 0 };
 		size_t n = SLOT_FIXED_COUNT;
+		struct evdev_device *device, *device_tmp;
+		wl_list_for_each(device, &host.evdev_devices, link)
+			pfds[n++] = (struct pollfd){ device->fd, POLLIN, 0 };
+		size_t evdev_end = n;
 		for (size_t i = 0; i < ARRAY_LEN(host.clip_reads); i++)
 			pfds[n++] = (struct pollfd){ host.clip_reads[i].fd, POLLIN, 0 };
 		struct clip_write *job, *tmp;
@@ -2935,11 +4170,26 @@ static void run(void)
 
 		if (pfds[SLOT_REPEAT].revents & POLLIN)
 			keyboard_handle_repeat();
+		if (pfds[SLOT_PROBE].revents & POLLIN)
+			probe_handle_timer();
+		if (pfds[SLOT_INOTIFY].revents & POLLIN)
+			evdev_inotify_read();
 
-		/* Dispatching may have replaced reads and writes, so the poll results
-		 * are matched to the current jobs by fd. Spurious readiness on a
-		 * reused fd is harmless because all of them are nonblocking. */
-		for (size_t i = SLOT_FIXED_COUNT; i < n; i++) {
+		/* Dispatching may have replaced devices, reads and writes, so the
+		 * poll results are matched to the current ones by fd. Spurious
+		 * readiness on a reused fd is harmless because all of them are
+		 * nonblocking. */
+		for (size_t i = SLOT_FIXED_COUNT; i < evdev_end; i++) {
+			if (!pfds[i].revents)
+				continue;
+			wl_list_for_each_safe(device, device_tmp, &host.evdev_devices, link) {
+				if (device->fd == pfds[i].fd) {
+					evdev_read(device);
+					break;
+				}
+			}
+		}
+		for (size_t i = evdev_end; i < n; i++) {
 			if (!pfds[i].revents || pfds[i].fd < 0)
 				continue;
 			for (size_t r = 0; r < ARRAY_LEN(host.clip_reads); r++) {
@@ -2974,10 +4224,15 @@ int main(int argc, char **argv)
 	wl_list_init(&host.dc_offers);
 	wl_list_init(&host.dc_sources);
 	wl_list_init(&host.clip_writes);
+	wl_list_init(&host.evdev_devices);
+	wl_list_init(&host.captures);
+	wl_list_init(&host.probe_surfaces);
 	for (size_t i = 0; i < ARRAY_LEN(host.clip_reads); i++)
 		host.clip_reads[i].fd = -1;
 	host.next_toplevel_id = 1;
 	host.repeat_fd = -1;
+	host.evdev_inotify_fd = -1;
+	host.evdev_reported = -1;
 
 	host.xkb_context = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
 	if (!host.xkb_context) {
@@ -2985,7 +4240,8 @@ int main(int argc, char **argv)
 		return 1;
 	}
 	host.repeat_fd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
-	if (host.repeat_fd < 0) {
+	host.probe_fd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
+	if (host.repeat_fd < 0 || host.probe_fd < 0) {
 		log_msg("timerfd_create: %s", strerror(errno));
 		return 1;
 	}
@@ -3007,6 +4263,10 @@ int main(int argc, char **argv)
 	}
 	if (!host.compositor)
 		fatal("compositor has no wl_compositor");
+	/* The keymap follows the keyboard created in the second roundtrip, and
+	 * the virtual keyboard should start with it. */
+	if (host.keyboard && !host.keymap && wl_display_roundtrip(host.display) < 0)
+		display_failed();
 
 	emit_ready();
 	if (host.probe) {

@@ -54,7 +54,8 @@ let nextPool = 1
 let mapSequence = 0
 const layerWindows = new Map<number, LayerWindow>()
 let focusedLayerWindow: LayerWindow | null = null
-let shortcutHandler: ((key: { sym: number; mods: KeyMods }) => boolean) | null = null
+export type LayerShortcutKey = { code: number; sym: number; mods: KeyMods }
+let shortcutHandler: ((key: LayerShortcutKey) => boolean) | null = null
 let pointer: { window: LayerWindow; x: number; y: number } | null = null
 const focusListeners = new Set<() => void>()
 
@@ -735,7 +736,7 @@ export function releaseLayerKeyboards (): void {
 /** Lets global shortcuts see key presses while a layer surface has keyboard
  *  focus, as X11 root grabs see them while an overlay window has focus. The
  *  handler returns true to swallow the key. */
-export function setLayerShortcutHandler (handler: ((key: { sym: number; mods: KeyMods }) => boolean) | null): void {
+export function setLayerShortcutHandler (handler: ((key: LayerShortcutKey) => boolean) | null): void {
   shortcutHandler = handler
 }
 

@@ -6,6 +6,7 @@ import { BrowserWindow, Rectangle, BrowserWindowConstructorOptions, WebPreferenc
 import { layerShellUsable, probeWaylandHost, WaylandHost } from './wayland/host'
 import { adoptLayerWindow, releaseLayerKeyboards } from './wayland/layer-window'
 import { FocusArbiter, ToplevelTracker, type TrackerEvent, x11BoundsToLogical } from './wayland/tracker'
+import { captureScreenRegion, listenNativeInput, type NativeInputEvent } from './wayland/native-input'
 const lib: AddonExports = require('node-gyp-build')(join(__dirname, '..'))
 
 export { layerShellUsable, probeWaylandHost, type HostFeatures, type WaylandOutput } from './wayland/host'
@@ -17,7 +18,8 @@ export {
   type LayerWindow,
   type LayerWindowOptions
 } from './wayland/layer-window'
-export { setLayerShortcutHandler } from './wayland/layer-window'
+export { setLayerShortcutHandler, type LayerShortcutKey } from './wayland/layer-window'
+export type { NativeInputEvent } from './wayland/native-input'
 
 interface AddonExports {
   start(
@@ -91,6 +93,49 @@ export const LAYER_SHELL_WEB_PREFERENCES: WebPreferences = {
   offscreen: true,
   // Hidden offscreen windows would otherwise throttle timers and rAF.
   backgroundThrottling: false
+}
+
+/**
+ * Input, pointer and capture for the target without any X server, for apps
+ * using the layer-shell backend. Each member returns null or false where the
+ * compositor or permissions do not allow it.
+ */
+export const waylandNative = {
+  /** Starts reading evdev (needs read access to /dev/input, usually the
+   *  `input` group). See `NativeInputEvent` for what is delivered when. */
+  listen (listener: (event: NativeInputEvent) => void): (() => void) | null {
+    const host = WaylandHost.get()
+    if (!host) return null
+    return listenNativeInput(host, () => OverlayController.targetHasFocus, listener)
+  },
+  /** Number of evdev devices being read; 0 usually means no permission. */
+  inputDevices (): number {
+    return WaylandHost.get()?.evdevDevices ?? 0
+  },
+  /** Presses or releases an evdev key, delivered to the focused window. */
+  key (code: number, pressed: boolean): boolean {
+    const host = WaylandHost.get()
+    if (!host?.features?.virtualKeyboard) return false
+    host.virtualKey(code, pressed)
+    return true
+  },
+  warpPointer (point: { x: number; y: number }): boolean {
+    const host = WaylandHost.get()
+    if (!host?.features?.virtualPointer) return false
+    host.warpPointer(point.x, point.y)
+    return true
+  },
+  probePointer (): Promise<{ x: number; y: number } | null> {
+    return WaylandHost.get()?.probePointer() ?? Promise.resolve(null)
+  },
+  canCapture (): boolean {
+    return !!WaylandHost.get()?.features?.screencopy
+  },
+  /** BGRA pixels of a logical screen rectangle, overlays included. */
+  capture (rect: Rectangle): Promise<{ width: number; height: number; data: Buffer } | null> {
+    const host = WaylandHost.get()
+    return host?.features?.screencopy ? captureScreenRegion(host, rect) : Promise.resolve(null)
+  }
 }
 
 /** Clipboard through the Wayland host's data-control connection. Chromium

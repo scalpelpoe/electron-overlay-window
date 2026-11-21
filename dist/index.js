@@ -1,6 +1,6 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.OverlayController = exports.waylandClipboard = exports.LAYER_SHELL_WEB_PREFERENCES = exports.OVERLAY_WINDOW_OPTS = exports.setLayerShortcutHandler = exports.releaseLayerKeyboards = exports.getLayerPointer = exports.getLayerWindow = exports.adoptLayerWindow = exports.probeWaylandHost = exports.layerShellUsable = void 0;
+exports.OverlayController = exports.waylandClipboard = exports.waylandNative = exports.LAYER_SHELL_WEB_PREFERENCES = exports.OVERLAY_WINDOW_OPTS = exports.setLayerShortcutHandler = exports.releaseLayerKeyboards = exports.getLayerPointer = exports.getLayerWindow = exports.adoptLayerWindow = exports.probeWaylandHost = exports.layerShellUsable = void 0;
 const node_events_1 = require("node:events");
 const node_path_1 = require("node:path");
 const throttle_debounce_1 = require("throttle-debounce");
@@ -9,6 +9,7 @@ const electron_2 = require("electron");
 const host_1 = require("./wayland/host");
 const layer_window_1 = require("./wayland/layer-window");
 const tracker_1 = require("./wayland/tracker");
+const native_input_1 = require("./wayland/native-input");
 const lib = require('node-gyp-build')((0, node_path_1.join)(__dirname, '..'));
 var host_2 = require("./wayland/host");
 Object.defineProperty(exports, "layerShellUsable", { enumerable: true, get: function () { return host_2.layerShellUsable; } });
@@ -49,6 +50,51 @@ exports.LAYER_SHELL_WEB_PREFERENCES = {
     offscreen: true,
     // Hidden offscreen windows would otherwise throttle timers and rAF.
     backgroundThrottling: false
+};
+/**
+ * Input, pointer and capture for the target without any X server, for apps
+ * using the layer-shell backend. Each member returns null or false where the
+ * compositor or permissions do not allow it.
+ */
+exports.waylandNative = {
+    /** Starts reading evdev (needs read access to /dev/input, usually the
+     *  `input` group). See `NativeInputEvent` for what is delivered when. */
+    listen(listener) {
+        const host = host_1.WaylandHost.get();
+        if (!host)
+            return null;
+        return (0, native_input_1.listenNativeInput)(host, () => exports.OverlayController.targetHasFocus, listener);
+    },
+    /** Number of evdev devices being read; 0 usually means no permission. */
+    inputDevices() {
+        return host_1.WaylandHost.get()?.evdevDevices ?? 0;
+    },
+    /** Presses or releases an evdev key, delivered to the focused window. */
+    key(code, pressed) {
+        const host = host_1.WaylandHost.get();
+        if (!host?.features?.virtualKeyboard)
+            return false;
+        host.virtualKey(code, pressed);
+        return true;
+    },
+    warpPointer(point) {
+        const host = host_1.WaylandHost.get();
+        if (!host?.features?.virtualPointer)
+            return false;
+        host.warpPointer(point.x, point.y);
+        return true;
+    },
+    probePointer() {
+        return host_1.WaylandHost.get()?.probePointer() ?? Promise.resolve(null);
+    },
+    canCapture() {
+        return !!host_1.WaylandHost.get()?.features?.screencopy;
+    },
+    /** BGRA pixels of a logical screen rectangle, overlays included. */
+    capture(rect) {
+        const host = host_1.WaylandHost.get();
+        return host?.features?.screencopy ? (0, native_input_1.captureScreenRegion)(host, rect) : Promise.resolve(null);
+    }
 };
 /** Clipboard through the Wayland host's data-control connection. Chromium
  *  only sees the Wayland clipboard while one of its own windows is focused,

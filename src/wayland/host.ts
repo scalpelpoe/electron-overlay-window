@@ -11,6 +11,9 @@ export interface HostFeatures {
   dataControl: boolean
   cursorShape: boolean
   viewporter: boolean
+  virtualKeyboard: boolean
+  virtualPointer: boolean
+  screencopy: boolean
 }
 
 /** An output in global logical coordinates. */
@@ -56,7 +59,7 @@ export type SurfaceEvent =
   | { ev: 'button'; sid: number; button: PointerButton; pressed: boolean; x: number; y: number }
   | { ev: 'axis'; sid: number; x: number; y: number; dx: number; dy: number; discreteX: number; discreteY: number }
   | { ev: 'focus'; sid: number; focused: boolean }
-  | { ev: 'key'; sid: number; pressed: boolean; repeat: boolean; keysym: string; sym: number; text: string; mods: KeyMods }
+  | { ev: 'key'; sid: number; pressed: boolean; repeat: boolean; code: number; keysym: string; sym: number; text: string; mods: KeyMods }
 
 type GlobalEvent =
   | ({ ev: 'ready' } & HostFeatures)
@@ -65,6 +68,17 @@ type GlobalEvent =
   | { ev: 'toplevel-closed'; tid: number }
   | { ev: 'clipboard'; text: string | null; html: string | null }
   | { ev: 'error'; message: string }
+  | { ev: 'evdev'; devices: number }
+  | ({ ev: 'input' } & EvdevEvent)
+  | { ev: 'capture'; id: string; width: number; height: number }
+  | { ev: 'capture'; id: string; error: string }
+  | { ev: 'probe'; id: string; x: number | null; y: number | null }
+
+/** A key, button or wheel event read from evdev. Key and button codes are
+ *  evdev codes (`linux/input-event-codes.h`). */
+export type EvdevEvent =
+  | { kind: 'key'; code: number; value: 0 | 1 | 2 }
+  | { kind: 'wheel'; value: number; horizontal: boolean }
 
 type HostEvent = SurfaceEvent | GlobalEvent
 
@@ -75,6 +89,9 @@ export type KeyboardMode = 'none' | 'on_demand' | 'exclusive'
 
 const LOG_PREFIX = '[electron-overlay-window] wayland:'
 const RESTART_DELAY_MS = 1000
+// Probes give up within about a second in the host; a capture waits for the
+// compositor, which may never answer.
+const REQUEST_TIMEOUT_MS = 3000
 
 /** Locates the host executable, preferring the asar-unpacked copy that a
  *  packaged Electron app can execute. */
@@ -138,6 +155,13 @@ export class WaylandHost {
   private readonly outputListeners = new Set<() => void>()
   private readonly restartListeners = new Set<() => void>()
   private readyWaiters: Array<() => void> = []
+  private readonly evdevListeners = new Set<(event: EvdevEvent) => void>()
+  private readonly pendingCaptures = new Map<string, (result: { width: number; height: number } | null) => void>()
+  private readonly pendingProbes = new Map<string, (point: { x: number; y: number } | null) => void>()
+  /** Keys and buttons reported down, released for listeners when the host goes away. */
+  private readonly heldEvdev = new Set<number>()
+  private nextRequest = 1
+  evdevDevices = 0
 
   private constructor (private readonly path: string) {}
 
@@ -172,6 +196,22 @@ export class WaylandHost {
     this.child?.stdin.end()
     this.child = null
     this.resolveReady()
+    this.abandonRequests()
+  }
+
+  /** Settles requests and releases keys the current host process can no
+   *  longer answer or report. */
+  private abandonRequests (): void {
+    for (const resolve of this.pendingCaptures.values()) resolve(null)
+    for (const resolve of this.pendingProbes.values()) resolve(null)
+    this.pendingCaptures.clear()
+    this.pendingProbes.clear()
+    this.evdevDevices = 0
+    const held = [...this.heldEvdev]
+    this.heldEvdev.clear()
+    for (const code of held) {
+      for (const listener of this.evdevListeners) listener({ kind: 'key', code, value: 0 })
+    }
   }
 
   private spawn (): void {
@@ -192,12 +232,15 @@ export class WaylandHost {
       }
     })
     createInterface({ input: child.stdout }).on('line', (line) => this.handleLine(line))
+    // A restarted host starts with evdev off.
+    if (this.evdevListeners.size > 0) this.send('evdev on')
     child.on('exit', (code, signal) => {
       if (this.child !== child) return
       this.child = null
       if (this.stopped) return
       console.error(LOG_PREFIX, `host exited (${signal ?? code}); restarting`)
       this.toplevels.clear()
+      this.abandonRequests()
       setTimeout(() => {
         if (this.stopped) return
         this.spawn()
@@ -246,12 +289,52 @@ export class WaylandHost {
       case 'error':
         console.error(LOG_PREFIX, event.message)
         break
+      case 'evdev':
+        this.evdevDevices = event.devices
+        break
+      case 'input': {
+        const { ev: _, ...input } = event
+        if (input.kind === 'key' && input.value === 1) this.heldEvdev.add(input.code)
+        else if (input.kind === 'key' && input.value === 0) this.heldEvdev.delete(input.code)
+        for (const listener of this.evdevListeners) listener(input)
+        break
+      }
+      case 'capture': {
+        const resolve = this.pendingCaptures.get(event.id)
+        this.pendingCaptures.delete(event.id)
+        if ('error' in event) console.warn(LOG_PREFIX, 'capture failed:', event.error)
+        resolve?.('error' in event ? null : { width: event.width, height: event.height })
+        break
+      }
+      case 'probe': {
+        const resolve = this.pendingProbes.get(event.id)
+        this.pendingProbes.delete(event.id)
+        resolve?.(event.x === null || event.y === null ? null : { x: event.x, y: event.y })
+        break
+      }
     }
   }
 
-  private send (line: string): void {
-    if (!this.child || this.child.stdin.destroyed) return
+  /** Returns false when there is no host to send to. */
+  private send (line: string): boolean {
+    if (!this.child || this.child.stdin.destroyed) return false
     this.child.stdin.write(line + '\n')
+    return true
+  }
+
+  private request<T> (pending: Map<string, (result: T | null) => void>, id: string, line: string): Promise<T | null> {
+    return new Promise((resolve) => {
+      pending.set(id, resolve)
+      const timer = setTimeout(() => {
+        if (pending.get(id) !== resolve) return
+        pending.delete(id)
+        resolve(null)
+      }, REQUEST_TIMEOUT_MS)
+      timer.unref?.()
+      if (this.send(line)) return
+      pending.delete(id)
+      resolve(null)
+    })
   }
 
   onSurface (sid: number, listener: SurfaceListener): () => void {
@@ -341,6 +424,42 @@ export class WaylandHost {
     this.clipboardHtml = html ?? null
     const encode = (value: string) => Buffer.from(value, 'utf8').toString('base64')
     this.send(`clipboard-set ${encode(text)} ${html ? encode(html) : '-'}`)
+  }
+
+  /** Reads keyboards and mice from evdev while there are listeners. */
+  onEvdev (listener: (event: EvdevEvent) => void): () => void {
+    this.evdevListeners.add(listener)
+    if (this.evdevListeners.size === 1) this.send('evdev on')
+    return () => {
+      this.evdevListeners.delete(listener)
+      if (this.evdevListeners.size === 0) this.send('evdev off')
+    }
+  }
+
+  /** Presses or releases an evdev key on the host's virtual keyboard. */
+  virtualKey (code: number, pressed: boolean): void {
+    this.send(`vkey ${code} ${pressed ? 1 : 0}`)
+  }
+
+  warpPointer (x: number, y: number): void {
+    this.send(`warp ${Math.round(x)} ${Math.round(y)}`)
+  }
+
+  /** Captures a logical rectangle into `path` as BGRA. Resolves to the pixel
+   *  size, or null on failure. */
+  capture (rect: { x: number; y: number; width: number; height: number }, path: string): Promise<{ width: number; height: number } | null> {
+    const id = `c${this.nextRequest++}`
+    const r = [rect.x, rect.y, rect.width, rect.height].map(Math.round)
+    // The path ends the command line.
+    if (/[\r\n]/.test(path)) return Promise.resolve(null)
+    return this.request(this.pendingCaptures, id, `capture ${id} ${r.join(' ')} ${path}`)
+  }
+
+  /** Global logical pointer position, found by briefly mapping input
+   *  surfaces over every output. */
+  probePointer (): Promise<{ x: number; y: number } | null> {
+    const id = `p${this.nextRequest++}`
+    return this.request(this.pendingProbes, id, `probe ${id}`)
   }
 
   clearClipboard (): void {

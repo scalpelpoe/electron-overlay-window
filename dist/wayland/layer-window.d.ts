@@ -6,6 +6,11 @@ interface Rect {
     width: number;
     height: number;
 }
+export type LayerShortcutKey = {
+    code: number;
+    sym: number;
+    mods: KeyMods;
+};
 /** Options for `adoptLayerWindow`. */
 export interface LayerWindowOptions {
     /** Frames per second Electron renders offscreen. Default 60. */
@@ -108,10 +113,7 @@ export declare function releaseLayerKeyboards(): void;
 /** Lets global shortcuts see key presses while a layer surface has keyboard
  *  focus, as X11 root grabs see them while an overlay window has focus. The
  *  handler returns true to swallow the key. */
-export declare function setLayerShortcutHandler(handler: ((key: {
-    sym: number;
-    mods: KeyMods;
-}) => boolean) | null): void;
+export declare function setLayerShortcutHandler(handler: ((key: LayerShortcutKey) => boolean) | null): void;
 /** Global logical pointer position while it is over a layer surface. */
 export declare function getLayerPointer(): {
     x: number;

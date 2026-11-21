@@ -84,9 +84,12 @@
             'src/lib/wayland/protocols/ext-data-control-v1.xml',
             'src/lib/wayland/protocols/tablet-v2.xml',
             'src/lib/wayland/protocols/viewporter.xml',
+            'src/lib/wayland/protocols/virtual-keyboard-unstable-v1.xml',
             'src/lib/wayland/protocols/wlr-data-control-unstable-v1.xml',
             'src/lib/wayland/protocols/wlr-foreign-toplevel-management-unstable-v1.xml',
             'src/lib/wayland/protocols/wlr-layer-shell-unstable-v1.xml',
+            'src/lib/wayland/protocols/wlr-screencopy-unstable-v1.xml',
+            'src/lib/wayland/protocols/wlr-virtual-pointer-unstable-v1.xml',
             'src/lib/wayland/protocols/xdg-output-unstable-v1.xml',
             'src/lib/wayland/protocols/xdg-shell.xml'
           ],

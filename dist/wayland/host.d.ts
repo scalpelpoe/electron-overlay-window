@@ -6,6 +6,9 @@ export interface HostFeatures {
     dataControl: boolean;
     cursorShape: boolean;
     viewporter: boolean;
+    virtualKeyboard: boolean;
+    virtualPointer: boolean;
+    screencopy: boolean;
 }
 /** An output in global logical coordinates. */
 export interface WaylandOutput {
@@ -86,10 +89,22 @@ export type SurfaceEvent = {
     sid: number;
     pressed: boolean;
     repeat: boolean;
+    code: number;
     keysym: string;
     sym: number;
     text: string;
     mods: KeyMods;
+};
+/** A key, button or wheel event read from evdev. Key and button codes are
+ *  evdev codes (`linux/input-event-codes.h`). */
+export type EvdevEvent = {
+    kind: 'key';
+    code: number;
+    value: 0 | 1 | 2;
+} | {
+    kind: 'wheel';
+    value: number;
+    horizontal: boolean;
 };
 type SurfaceListener = (event: SurfaceEvent) => void;
 export type InputRegion = 'all' | 'none' | ReadonlyArray<{
@@ -127,6 +142,13 @@ export declare class WaylandHost {
     private readonly outputListeners;
     private readonly restartListeners;
     private readyWaiters;
+    private readonly evdevListeners;
+    private readonly pendingCaptures;
+    private readonly pendingProbes;
+    /** Keys and buttons reported down, released for listeners when the host goes away. */
+    private readonly heldEvdev;
+    private nextRequest;
+    evdevDevices: number;
     private constructor();
     static get(): WaylandHost | null;
     /** Spawns the host once. Returns null when the executable is unavailable. */
@@ -135,9 +157,14 @@ export declare class WaylandHost {
     ready(): Promise<void>;
     private resolveReady;
     stop(): void;
+    /** Settles requests and releases keys the current host process can no
+     *  longer answer or report. */
+    private abandonRequests;
     private spawn;
     private handleLine;
+    /** Returns false when there is no host to send to. */
     private send;
+    private request;
     onSurface(sid: number, listener: SurfaceListener): () => void;
     onToplevel(listener: (info: ToplevelInfo | {
         tid: number;
@@ -171,6 +198,28 @@ export declare class WaylandHost {
     /** Owns the selection. The local cache is updated immediately so a
      *  following read returns the written value. */
     writeClipboard(text: string, html?: string): void;
+    /** Reads keyboards and mice from evdev while there are listeners. */
+    onEvdev(listener: (event: EvdevEvent) => void): () => void;
+    /** Presses or releases an evdev key on the host's virtual keyboard. */
+    virtualKey(code: number, pressed: boolean): void;
+    warpPointer(x: number, y: number): void;
+    /** Captures a logical rectangle into `path` as BGRA. Resolves to the pixel
+     *  size, or null on failure. */
+    capture(rect: {
+        x: number;
+        y: number;
+        width: number;
+        height: number;
+    }, path: string): Promise<{
+        width: number;
+        height: number;
+    } | null>;
+    /** Global logical pointer position, found by briefly mapping input
+     *  surfaces over every output. */
+    probePointer(): Promise<{
+        x: number;
+        y: number;
+    } | null>;
     clearClipboard(): void;
     /** The output containing the rectangle's center, else the most overlapped
      *  one. Mirrors the host's placement rule. */

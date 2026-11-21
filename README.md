@@ -58,8 +58,12 @@ app.whenReady().then(() => {
   of resizable windows move and resize the window.
 - Chromium only sees the Wayland clipboard while one of its windows is
   focused. `waylandClipboard` reads and writes it through the host instead.
-- Electron's `globalShortcut` does not work on Wayland. `setLayerShortcutHandler`
-  receives keys typed into an overlay.
+- Electron's `globalShortcut` does not work on Wayland, and nothing outside
+  the compositor sees the target's input. `waylandNative` reads keys, buttons
+  and the wheel from evdev while the target has focus (the user needs read
+  access to `/dev/input`), types with a virtual keyboard, warps and finds the
+  pointer, and captures screen regions. `setLayerShortcutHandler` receives keys
+  typed into an overlay. evdev cannot keep a key from the target.
 - IME composition, tooltips and native context menus are unavailable in
   offscreen windows.
 
