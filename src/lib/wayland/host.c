@@ -486,9 +486,9 @@ struct probe_surface {
 
 static struct host {
 	bool probe, ready;
-	/* Fallback for compositors without the wlroots protocols, decided
+	/* Fallbacks for compositors without the wlroots protocols, decided
 	 * before `ready`. */
-	bool kwin_script;
+	bool kwin_script, remote_desktop;
 	struct wl_display *display;
 	struct wl_registry *registry;
 
@@ -3138,8 +3138,10 @@ static void cmd_vkey(char **argv, size_t argc)
 	}
 	if (host.vk_manager)
 		vk_key(code, state == 1);
-	else
+	else if (uinput_ensure())
 		uinput_key(code, state == 1);
+	else if (!rd_key(code, state == 1))
+		log_msg("vkey: no virtual keyboard, uinput keyboard or remote desktop keyboard");
 }
 
 /* Virtual pointer */
@@ -3186,7 +3188,8 @@ static void cmd_warp(char **argv, size_t argc)
 		return;
 	}
 	if (!host.vp_manager) {
-		log_msg("warp: zwlr_virtual_pointer_manager_v1 is unavailable");
+		if (!rd_warp(x, y))
+			log_msg("warp: no virtual pointer and no remote desktop pointer at %g,%g", x, y);
 		return;
 	}
 	if (!host.seat) {
@@ -4092,6 +4095,28 @@ static void cmd_clipboard_clear(char **argv, size_t argc)
 	dc_set_selection(NULL);
 }
 
+static void cmd_remote_desktop(char **argv, size_t argc)
+{
+	if (strcmp(argv[1], "stop") == 0 && argc == 2) {
+		rd_stop();
+		return;
+	}
+	if (strcmp(argv[1], "start") != 0) {
+		log_msg("remote-desktop: expected start or stop");
+		return;
+	}
+	if (!host.remote_desktop) {
+		ev_begin("remote-desktop");
+		ev_str("state", "closed");
+		ev_bool("keyboard", false);
+		ev_bool("pointer", false);
+		ev_str("reason", "unavailable");
+		ev_end();
+		return;
+	}
+	rd_start(argc > 2 && strcmp(argv[2], "-") != 0 ? argv[2] : NULL);
+}
+
 static void cmd_quit(char **argv, size_t argc)
 {
 	wl_display_flush(host.display);
@@ -4123,6 +4148,7 @@ static const struct command {
 	{ "warp", 3, 3, cmd_warp },
 	{ "capture", 7, 0, cmd_capture },
 	{ "probe", 2, 2, cmd_probe },
+	{ "remote-desktop", 2, 3, cmd_remote_desktop },
 	{ "quit", 1, 1, cmd_quit },
 };
 
@@ -4221,6 +4247,7 @@ static void emit_ready(void)
 	ev_bool("virtualPointer", host.vp_manager != NULL);
 	ev_bool("screencopy", host.screencopy != NULL);
 	ev_bool("kwinScript", host.kwin_script);
+	ev_bool("remoteDesktop", host.remote_desktop);
 	ev_end();
 }
 
@@ -4231,6 +4258,7 @@ enum poll_slot {
 	SLOT_PROBE,
 	SLOT_INOTIFY,
 	SLOT_BUS,
+	SLOT_EI,
 	SLOT_FIXED_COUNT
 };
 
@@ -4273,6 +4301,7 @@ static void run(void)
 		/* poll ignores negative fds, which stand for off. */
 		pfds[SLOT_INOTIFY] = (struct pollfd){ host.evdev_inotify_fd, POLLIN, 0 };
 		pfds[SLOT_BUS] = (struct pollfd){ bus_fd(), POLLIN, 0 };
+		pfds[SLOT_EI] = (struct pollfd){ rd_fd(), POLLIN, 0 };
 		size_t n = SLOT_FIXED_COUNT;
 		struct evdev_device *device, *device_tmp;
 		wl_list_for_each(device, &host.evdev_devices, link)
@@ -4308,6 +4337,8 @@ static void run(void)
 			evdev_inotify_read();
 		if (pfds[SLOT_BUS].revents)
 			bus_dispatch(true);
+		if (pfds[SLOT_EI].revents)
+			rd_dispatch();
 
 		/* Dispatching may have replaced devices, reads and writes, so the
 		 * poll results are matched to the current ones by fd. Spurious
@@ -4405,9 +4436,10 @@ int main(int argc, char **argv)
 	if (host.keyboard && !host.keymap && wl_display_roundtrip(host.display) < 0)
 		display_failed();
 
-	/* Only looked for where the wlroots protocol is missing, so that other
-	 * compositors never wait for the session bus. */
+	/* Only looked for where the wlroots protocols are missing, so that
+	 * other compositors never wait for the session bus. */
 	host.kwin_script = !host.toplevel_global && kwin_available();
+	host.remote_desktop = !host.vk_manager && rd_available();
 	emit_ready();
 	if (host.probe) {
 		wl_display_disconnect(host.display);

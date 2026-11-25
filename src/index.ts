@@ -3,13 +3,24 @@ import { join } from 'node:path'
 import { throttle } from 'throttle-debounce'
 import { screen } from 'electron'
 import { BrowserWindow, Rectangle, BrowserWindowConstructorOptions, WebPreferences } from 'electron'
-import { layerShellUsable, probeWaylandHost, WaylandHost, windowTracking } from './wayland/host'
+import { layerShellUsable, nativeBackends, type NativeBackends, probeWaylandHost, WaylandHost, windowTracking } from './wayland/host'
+import type { RemoteDesktopStatus } from './wayland/remote-desktop'
 import { adoptLayerWindow, releaseLayerKeyboards } from './wayland/layer-window'
 import { FocusArbiter, ToplevelTracker, type TrackerEvent, x11BoundsToLogical } from './wayland/tracker'
 import { captureScreenRegion, listenNativeInput, type NativeInputEvent } from './wayland/native-input'
 const lib: AddonExports = require('node-gyp-build')(join(__dirname, '..'))
 
-export { layerShellUsable, probeWaylandHost, windowTracking, type HostFeatures, type WaylandOutput } from './wayland/host'
+export {
+  layerShellUsable,
+  nativeBackends,
+  nativeModeUsable,
+  probeWaylandHost,
+  windowTracking,
+  type HostFeatures,
+  type NativeBackends,
+  type WaylandOutput
+} from './wayland/host'
+export type { RemoteDesktopStatus } from './wayland/remote-desktop'
 export {
   adoptLayerWindow,
   getLayerWindow,
@@ -112,18 +123,28 @@ export const waylandNative = {
   inputDevices (): number {
     return WaylandHost.get()?.evdevDevices ?? 0
   },
+  /** How tracking, keys, pointer warps and capture are provided by the
+   *  running host. All null before the host is ready. */
+  backends (): NativeBackends {
+    return nativeBackends(WaylandHost.get()?.features ?? null)
+  },
   /** Presses or releases an evdev key, delivered to the focused window.
    *  Without a virtual keyboard (KWin) this needs write access to
-   *  /dev/uinput, and keys combine with physically held modifiers. */
+   *  /dev/uinput, where keys combine with physically held modifiers, or else
+   *  an active `waylandRemoteDesktop` session. */
   key (code: number, pressed: boolean): boolean {
     const host = WaylandHost.get()
-    if (!host?.features?.virtualKeyboard && !host?.features?.uinput) return false
+    if (!host?.features?.virtualKeyboard && !host?.features?.uinput && !host?.remoteDesktop.status.keyboard) {
+      return false
+    }
     host.virtualKey(code, pressed)
     return true
   },
+  /** Without a virtual pointer this needs an active `waylandRemoteDesktop`
+   *  session whose pointer covers the point. */
   warpPointer (point: { x: number; y: number }): boolean {
     const host = WaylandHost.get()
-    if (!host?.features?.virtualPointer) return false
+    if (!host?.features?.virtualPointer && !host?.remoteDesktop.status.pointer) return false
     host.warpPointer(point.x, point.y)
     return true
   },
@@ -137,6 +158,39 @@ export const waylandNative = {
   capture (rect: Rectangle): Promise<{ width: number; height: number; data: Buffer } | null> {
     const host = WaylandHost.get()
     return host?.features?.screencopy ? captureScreenRegion(host, rect) : Promise.resolve(null)
+  }
+}
+
+/**
+ * Input injection through the xdg-desktop-portal RemoteDesktop interface and
+ * libei, for compositors without a virtual keyboard (KWin). `waylandNative.key`
+ * and `warpPointer` use the session once `status()` reports `keyboard` or
+ * `pointer`. Starting a session shows the portal's approval dialog unless a
+ * restore token from an earlier session is accepted; store every token
+ * `onRestoreToken` reports, since each is valid once. A restarted host resumes
+ * the session with the newest token. Untested on Plasma. Members return null
+ * or false before `useLayerShell` started the host.
+ */
+export const waylandRemoteDesktop = {
+  /** Whether the host can start a session. False until the host is ready. */
+  available (): boolean {
+    return !!WaylandHost.get()?.features?.remoteDesktop
+  },
+  /** Without `restoreToken`, the newest token this process has seen is used. */
+  start (restoreToken?: string): boolean {
+    return WaylandHost.get()?.remoteDesktop.start(restoreToken) ?? false
+  },
+  stop (): void {
+    WaylandHost.get()?.remoteDesktop.stop()
+  },
+  status (): RemoteDesktopStatus | null {
+    return WaylandHost.get()?.remoteDesktop.status ?? null
+  },
+  onStatus (listener: (status: RemoteDesktopStatus) => void): (() => void) | null {
+    return WaylandHost.get()?.remoteDesktop.onStatus(listener) ?? null
+  },
+  onRestoreToken (listener: (token: string) => void): (() => void) | null {
+    return WaylandHost.get()?.remoteDesktop.onToken(listener) ?? null
   }
 }
 

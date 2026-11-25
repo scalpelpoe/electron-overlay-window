@@ -1,7 +1,10 @@
 import { EventEmitter } from 'node:events';
 import { BrowserWindow, Rectangle, BrowserWindowConstructorOptions, WebPreferences } from 'electron';
+import { type NativeBackends } from './wayland/host';
+import type { RemoteDesktopStatus } from './wayland/remote-desktop';
 import { type NativeInputEvent } from './wayland/native-input';
-export { layerShellUsable, probeWaylandHost, windowTracking, type HostFeatures, type WaylandOutput } from './wayland/host';
+export { layerShellUsable, nativeBackends, nativeModeUsable, probeWaylandHost, windowTracking, type HostFeatures, type NativeBackends, type WaylandOutput } from './wayland/host';
+export type { RemoteDesktopStatus } from './wayland/remote-desktop';
 export { adoptLayerWindow, getLayerWindow, getLayerPointer, releaseLayerKeyboards, type LayerWindow, type LayerWindowOptions } from './wayland/layer-window';
 export { setLayerShortcutHandler, type LayerShortcutKey } from './wayland/layer-window';
 export type { NativeInputEvent } from './wayland/native-input';
@@ -41,10 +44,16 @@ export declare const waylandNative: {
     listen(listener: (event: NativeInputEvent) => void): (() => void) | null;
     /** Number of evdev devices being read; 0 usually means no permission. */
     inputDevices(): number;
+    /** How tracking, keys, pointer warps and capture are provided by the
+     *  running host. All null before the host is ready. */
+    backends(): NativeBackends;
     /** Presses or releases an evdev key, delivered to the focused window.
      *  Without a virtual keyboard (KWin) this needs write access to
-     *  /dev/uinput, and keys combine with physically held modifiers. */
+     *  /dev/uinput, where keys combine with physically held modifiers, or else
+     *  an active `waylandRemoteDesktop` session. */
     key(code: number, pressed: boolean): boolean;
+    /** Without a virtual pointer this needs an active `waylandRemoteDesktop`
+     *  session whose pointer covers the point. */
     warpPointer(point: {
         x: number;
         y: number;
@@ -60,6 +69,26 @@ export declare const waylandNative: {
         height: number;
         data: Buffer;
     } | null>;
+};
+/**
+ * Input injection through the xdg-desktop-portal RemoteDesktop interface and
+ * libei, for compositors without a virtual keyboard (KWin). `waylandNative.key`
+ * and `warpPointer` use the session once `status()` reports `keyboard` or
+ * `pointer`. Starting a session shows the portal's approval dialog unless a
+ * restore token from an earlier session is accepted; store every token
+ * `onRestoreToken` reports, since each is valid once. A restarted host resumes
+ * the session with the newest token. Untested on Plasma. Members return null
+ * or false before `useLayerShell` started the host.
+ */
+export declare const waylandRemoteDesktop: {
+    /** Whether the host can start a session. False until the host is ready. */
+    available(): boolean;
+    /** Without `restoreToken`, the newest token this process has seen is used. */
+    start(restoreToken?: string): boolean;
+    stop(): void;
+    status(): RemoteDesktopStatus | null;
+    onStatus(listener: (status: RemoteDesktopStatus) => void): (() => void) | null;
+    onRestoreToken(listener: (token: string) => void): (() => void) | null;
 };
 /** Clipboard through the Wayland host's data-control connection. Chromium
  *  only sees the Wayland clipboard while one of its own windows is focused,

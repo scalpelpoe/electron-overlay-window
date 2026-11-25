@@ -1,6 +1,6 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.OverlayController = exports.waylandClipboard = exports.waylandNative = exports.LAYER_SHELL_WEB_PREFERENCES = exports.OVERLAY_WINDOW_OPTS = exports.setLayerShortcutHandler = exports.releaseLayerKeyboards = exports.getLayerPointer = exports.getLayerWindow = exports.adoptLayerWindow = exports.windowTracking = exports.probeWaylandHost = exports.layerShellUsable = void 0;
+exports.OverlayController = exports.waylandClipboard = exports.waylandRemoteDesktop = exports.waylandNative = exports.LAYER_SHELL_WEB_PREFERENCES = exports.OVERLAY_WINDOW_OPTS = exports.setLayerShortcutHandler = exports.releaseLayerKeyboards = exports.getLayerPointer = exports.getLayerWindow = exports.adoptLayerWindow = exports.windowTracking = exports.probeWaylandHost = exports.nativeModeUsable = exports.nativeBackends = exports.layerShellUsable = void 0;
 const node_events_1 = require("node:events");
 const node_path_1 = require("node:path");
 const throttle_debounce_1 = require("throttle-debounce");
@@ -13,6 +13,8 @@ const native_input_1 = require("./wayland/native-input");
 const lib = require('node-gyp-build')((0, node_path_1.join)(__dirname, '..'));
 var host_2 = require("./wayland/host");
 Object.defineProperty(exports, "layerShellUsable", { enumerable: true, get: function () { return host_2.layerShellUsable; } });
+Object.defineProperty(exports, "nativeBackends", { enumerable: true, get: function () { return host_2.nativeBackends; } });
+Object.defineProperty(exports, "nativeModeUsable", { enumerable: true, get: function () { return host_2.nativeModeUsable; } });
 Object.defineProperty(exports, "probeWaylandHost", { enumerable: true, get: function () { return host_2.probeWaylandHost; } });
 Object.defineProperty(exports, "windowTracking", { enumerable: true, get: function () { return host_2.windowTracking; } });
 var layer_window_2 = require("./wayland/layer-window");
@@ -70,19 +72,28 @@ exports.waylandNative = {
     inputDevices() {
         return host_1.WaylandHost.get()?.evdevDevices ?? 0;
     },
+    /** How tracking, keys, pointer warps and capture are provided by the
+     *  running host. All null before the host is ready. */
+    backends() {
+        return (0, host_1.nativeBackends)(host_1.WaylandHost.get()?.features ?? null);
+    },
     /** Presses or releases an evdev key, delivered to the focused window.
      *  Without a virtual keyboard (KWin) this needs write access to
-     *  /dev/uinput, and keys combine with physically held modifiers. */
+     *  /dev/uinput, where keys combine with physically held modifiers, or else
+     *  an active `waylandRemoteDesktop` session. */
     key(code, pressed) {
         const host = host_1.WaylandHost.get();
-        if (!host?.features?.virtualKeyboard && !host?.features?.uinput)
+        if (!host?.features?.virtualKeyboard && !host?.features?.uinput && !host?.remoteDesktop.status.keyboard) {
             return false;
+        }
         host.virtualKey(code, pressed);
         return true;
     },
+    /** Without a virtual pointer this needs an active `waylandRemoteDesktop`
+     *  session whose pointer covers the point. */
     warpPointer(point) {
         const host = host_1.WaylandHost.get();
-        if (!host?.features?.virtualPointer)
+        if (!host?.features?.virtualPointer && !host?.remoteDesktop.status.pointer)
             return false;
         host.warpPointer(point.x, point.y);
         return true;
@@ -97,6 +108,38 @@ exports.waylandNative = {
     capture(rect) {
         const host = host_1.WaylandHost.get();
         return host?.features?.screencopy ? (0, native_input_1.captureScreenRegion)(host, rect) : Promise.resolve(null);
+    }
+};
+/**
+ * Input injection through the xdg-desktop-portal RemoteDesktop interface and
+ * libei, for compositors without a virtual keyboard (KWin). `waylandNative.key`
+ * and `warpPointer` use the session once `status()` reports `keyboard` or
+ * `pointer`. Starting a session shows the portal's approval dialog unless a
+ * restore token from an earlier session is accepted; store every token
+ * `onRestoreToken` reports, since each is valid once. A restarted host resumes
+ * the session with the newest token. Untested on Plasma. Members return null
+ * or false before `useLayerShell` started the host.
+ */
+exports.waylandRemoteDesktop = {
+    /** Whether the host can start a session. False until the host is ready. */
+    available() {
+        return !!host_1.WaylandHost.get()?.features?.remoteDesktop;
+    },
+    /** Without `restoreToken`, the newest token this process has seen is used. */
+    start(restoreToken) {
+        return host_1.WaylandHost.get()?.remoteDesktop.start(restoreToken) ?? false;
+    },
+    stop() {
+        host_1.WaylandHost.get()?.remoteDesktop.stop();
+    },
+    status() {
+        return host_1.WaylandHost.get()?.remoteDesktop.status ?? null;
+    },
+    onStatus(listener) {
+        return host_1.WaylandHost.get()?.remoteDesktop.onStatus(listener) ?? null;
+    },
+    onRestoreToken(listener) {
+        return host_1.WaylandHost.get()?.remoteDesktop.onToken(listener) ?? null;
     }
 };
 /** Clipboard through the Wayland host's data-control connection. Chromium

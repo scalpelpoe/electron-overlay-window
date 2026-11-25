@@ -69,6 +69,17 @@ app.whenReady().then(() => {
   `/dev/uinput`), warps and finds the pointer, and captures screen regions.
   `setLayerShortcutHandler` receives keys typed into an overlay. evdev cannot
   keep a key from the target.
+- KWin has no virtual keyboard or pointer protocol. There, keys go through the
+  uinput keyboard when `/dev/uinput` is writable. Otherwise keys, and pointer
+  warps in any case, go through the RemoteDesktop portal and libei once
+  `waylandRemoteDesktop.start()` has a session, which the user approves in a
+  portal dialog (Plasma 6.1 or later, built when the `libei-1.0` headers are
+  found). Store each token from `onRestoreToken` and pass it to the next
+  `start` to skip the dialog where the portal supports persistence, which is
+  unverified for KDE. Untested on Plasma.
+- `nativeBackends(features)` names how tracking, keys, pointer warps and
+  capture are provided, and `nativeModeUsable(features)` tells whether an app
+  can run under `--ozone-platform=wayland` without an X server.
 - IME composition, tooltips and native context menus are unavailable in
   offscreen windows.
 

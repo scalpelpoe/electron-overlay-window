@@ -44,12 +44,33 @@ The script targets the Plasma 6 scripting API, so the host does not use it when
 host unloads and removes those of hosts that were killed. **This path is
 untested on Plasma.**
 
+KWin also lacks `zwp_virtual_keyboard_v1` and `zwlr_virtual_pointer_v1`.
+Without a virtual keyboard, `vkey` and `warp` go through the xdg-desktop-portal
+RemoteDesktop interface instead: the host creates a session for keyboard and
+pointer devices, starts it, calls `ConnectToEIS` (interface version 2, KWin
+since Plasma 6.1) and sends evdev key codes and absolute pointer motion with
+libei. A session starts only on `remote-desktop start`, because the portal asks
+the user for approval.
+
+The host asks for persistence (`persist_mode` 2) and passes the restore token
+it is given. The portal answers with a new token, reported as a
+`remote-desktop-token` event; each token is valid once. The host stays
+stateless, so the client stores the newest token and hands it back on the next
+start. Whether xdg-desktop-portal-kde honors RemoteDesktop persistence is
+unverified: KDE bug 480235 reports restored sessions still prompting, and
+`xdg-desktop-portal` rejects `persist_mode` with "Remote desktop sessions cannot
+persist" when the backend implements an older interface. The host then retries
+without persistence, so the dialog appears on every start. **This path is
+untested on Plasma.**
+
 `protocols/` holds the protocol XML, copied unchanged from wayland-protocols,
 wlr-protocols and wlroots. The build generates the C glue from it with
 `wayland-scanner`, so the host needs `wayland-scanner` in addition to the
 `wayland-client`, `wayland-cursor` and `xkbcommon` development files. KWin
-support is built when pkg-config also finds `dbus-1`; Electron links libdbus
-itself, so it adds no runtime dependency.
+window tracking is built when pkg-config also finds `dbus-1`; Electron links
+libdbus itself, so it adds no runtime dependency. The RemoteDesktop path also
+needs the `libei-1.0` headers. The host loads `libei.so.1` at run time and
+reports `remoteDesktop` as false where it is missing.
 
 ## Wire protocol
 
@@ -95,10 +116,12 @@ client, `<tid>` a toplevel id chosen by the host. Text payloads are base64.
 | `clipboard-set <text> <html\|->` | Own the selection with text, and optionally HTML. |
 | `clipboard-clear` | Clear the selection. |
 | `evdev on\|off` | Start or stop reading keyboards and mice from `/dev/input`. Devices that appear later are opened too. |
-| `vkey <code> <0\|1>` | Release or press evdev key `code` on a virtual keyboard that uses the seat's keymap. The host keeps its modifier state. Without `zwp_virtual_keyboard_manager_v1` the key goes to a uinput keyboard instead, created on `evdev on` or the first `vkey`; it supports codes below `BTN_MISC` and is never read back as evdev input. |
-| `warp <x> <y>` | Move the pointer to a global logical position with a virtual pointer. |
+| `vkey <code> <0\|1>` | Release or press evdev key `code` on a virtual keyboard that uses the seat's keymap. The host keeps its modifier state. Without `zwp_virtual_keyboard_manager_v1` the key goes to a uinput keyboard instead, created on `evdev on` or the first `vkey`; it supports codes below `BTN_MISC` and is never read back as evdev input. Without either, the key goes through the RemoteDesktop session, if one is active. |
+| `warp <x> <y>` | Move the pointer to a global logical position with a virtual pointer, or else with the RemoteDesktop session's absolute pointer, if one of its regions contains the position. |
 | `capture <id> <x> <y> <w> <h> <path>` | Capture a global logical rectangle, which must lie within one output, without the cursor, into a new file at `path` (the rest of the line). |
 | `probe <id>` | Find the pointer: map a transparent input surface over every output on the overlay layer until one receives `wl_pointer.enter`, then remove them. |
+| `remote-desktop start <token\|->` | Start a RemoteDesktop session, restoring the one the token belongs to where the portal allows. Without `remoteDesktop` it only reports `closed` with reason `unavailable`. |
+| `remote-desktop stop` | Close the session. |
 
 ### Events
 
@@ -106,7 +129,7 @@ JSON objects with an `ev` field.
 
 | Event | Fields |
 | --- | --- |
-| `ready` | `layerShell`, `layerShellVersion`, `foreignToplevel`, `dataControl`, `cursorShape`, `viewporter`, `virtualKeyboard`, `virtualPointer`, `screencopy`: availability of each global; `uinput`: whether `/dev/uinput` is writable. `kwinScript`: windows are tracked through a KWin script, only checked without `foreignToplevel`. Sent once after the initial roundtrips. |
+| `ready` | `layerShell`, `layerShellVersion`, `foreignToplevel`, `dataControl`, `cursorShape`, `viewporter`, `virtualKeyboard`, `virtualPointer`, `screencopy`: availability of each global; `uinput`: whether `/dev/uinput` is writable. `kwinScript`: windows are tracked through a KWin script, only checked without `foreignToplevel`. `remoteDesktop`: the portal offers RemoteDesktop version 2 and libei loaded, only checked without `virtualKeyboard`. Sent once after the initial roundtrips. |
 | `outputs` | `outputs`: array of `{ name, description, x, y, width, height, scale }` in logical coordinates. Sent after `ready` and whenever an output changes. |
 | `configure` | `sid`, `width`, `height`: the size the compositor assigned. Sent for every new layer surface, which starts empty unless a buffer was held for it, and when the size changes. |
 | `closed` | `sid`: the compositor closed the layer surface, for example because its output disappeared. The surface is hidden. |
@@ -124,4 +147,6 @@ JSON objects with an `ev` field.
 | `input` | `kind` `key`, `code` (evdev code, including `BTN_*` mouse buttons), `value` (0 release, 1 press, 2 autorepeat); or `kind` `wheel`, `value` (detents, positive is up or right), `horizontal`. |
 | `capture` | `id`, `width`, `height`: the file holds BGRA pixels with stride `width*4`, top row first, alpha 255. Or `id`, `error`. |
 | `probe` | `id`, `x`, `y`: global logical pointer position, both `null` when no surface was entered within 200 ms. |
+| `remote-desktop` | `state` (`starting`, `active`, `closed`), `keyboard`, `pointer` (whether a resumed device can send keys or absolute motion), and for `closed` a `reason`: `cancelled`, `stopped`, `closed` (by the portal), `disconnected` (by EIS), `unavailable`, or a failure message. Sent on every change. |
+| `remote-desktop-token` | `token`: a restore token for the next `remote-desktop start`. |
 | `error` | `message`. Fatal errors are followed by exit. |

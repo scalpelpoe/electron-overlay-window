@@ -2,6 +2,7 @@ import { type ChildProcessWithoutNullStreams, execFileSync, spawn } from 'node:c
 import { existsSync } from 'node:fs'
 import { join, sep } from 'node:path'
 import { createInterface } from 'node:readline'
+import { RemoteDesktopClient, type RemoteDesktopEvent } from './remote-desktop'
 
 /** Availability of the compositor globals the host uses. */
 export interface HostFeatures {
@@ -19,6 +20,10 @@ export interface HostFeatures {
   /** Windows are tracked through a KWin script, because the compositor lacks
    *  foreign-toplevel management. Untested on Plasma. */
   kwinScript: boolean
+  /** Keys and pointer warps can go through the RemoteDesktop portal and
+   *  libei, because the compositor lacks the virtual keyboard protocol. A
+   *  session needs the user's approval. Untested on Plasma. */
+  remoteDesktop: boolean
 }
 
 /** An output in global logical coordinates. */
@@ -81,6 +86,7 @@ type GlobalEvent =
   | { ev: 'capture'; id: string; width: number; height: number }
   | { ev: 'capture'; id: string; error: string }
   | { ev: 'probe'; id: string; x: number | null; y: number | null }
+  | RemoteDesktopEvent
 
 /** A key, button or wheel event read from evdev. Key and button codes are
  *  evdev codes (`linux/input-event-codes.h`). */
@@ -127,6 +133,40 @@ export function windowTracking (features: HostFeatures | null): 'foreign-topleve
   return null
 }
 
+/** How each native capability is provided, or null where it is not. A
+ *  `remote-desktop` backend works only while a portal session is active.
+ *  `uinput` keys combine with physically held modifiers. */
+export interface NativeBackends {
+  tracking: 'foreign-toplevel' | 'kwin-script' | null
+  keys: 'virtual-keyboard' | 'uinput' | 'remote-desktop' | null
+  pointer: 'virtual-pointer' | 'remote-desktop' | null
+  capture: 'screencopy' | null
+}
+
+export function nativeBackends (features: HostFeatures | null): NativeBackends {
+  return {
+    tracking: windowTracking(features),
+    keys: features?.virtualKeyboard
+      ? 'virtual-keyboard'
+      : features?.uinput
+        ? 'uinput'
+        : features?.remoteDesktop
+          ? 'remote-desktop'
+          : null,
+    pointer: features?.virtualPointer ? 'virtual-pointer' : features?.remoteDesktop ? 'remote-desktop' : null,
+    capture: features?.screencopy ? 'screencopy' : null
+  }
+}
+
+/** Whether the layer-shell backend can run without an X server: overlays as
+ *  layer surfaces, the target tracked natively, and keys typed into it.
+ *  Reading input additionally needs access to /dev/input, which only a
+ *  running host can tell (`waylandNative.inputDevices`). */
+export function nativeModeUsable (features: HostFeatures | null): boolean {
+  const backends = nativeBackends(features)
+  return layerShellUsable(features) && backends.tracking !== null && backends.keys !== null
+}
+
 /** Synchronously asks the compositor which globals it offers. Returns null when
  *  the host is missing, no Wayland compositor is reachable, or the probe fails.
  *  Safe to call before Electron's `ready` event, so an app can choose its Ozone
@@ -163,6 +203,7 @@ export class WaylandHost {
   readonly toplevels = new Map<number, ToplevelInfo>()
   clipboardText: string | null = null
   clipboardHtml: string | null = null
+  readonly remoteDesktop = new RemoteDesktopClient((line) => this.send(line))
 
   private child: ChildProcessWithoutNullStreams | null = null
   private stopped = false
@@ -222,6 +263,7 @@ export class WaylandHost {
     for (const resolve of this.pendingProbes.values()) resolve(null)
     this.pendingCaptures.clear()
     this.pendingProbes.clear()
+    this.remoteDesktop.abandon()
     this.evdevDevices = 0
     const held = [...this.heldEvdev]
     this.heldEvdev.clear()
@@ -260,6 +302,7 @@ export class WaylandHost {
       setTimeout(() => {
         if (this.stopped) return
         this.spawn()
+        this.remoteDesktop.restarted()
         for (const listener of this.restartListeners) listener()
       }, RESTART_DELAY_MS)
     })
@@ -328,6 +371,10 @@ export class WaylandHost {
         resolve?.(event.x === null || event.y === null ? null : { x: event.x, y: event.y })
         break
       }
+      case 'remote-desktop':
+      case 'remote-desktop-token':
+        this.remoteDesktop.handle(event)
+        break
     }
   }
 
@@ -452,8 +499,9 @@ export class WaylandHost {
     }
   }
 
-  /** Presses or releases an evdev key on the host's virtual keyboard, or on
-   *  its uinput keyboard where the compositor offers no virtual keyboard. */
+  /** Presses or releases an evdev key on the host's virtual keyboard, on its
+   *  uinput keyboard where the compositor offers no virtual keyboard, or else
+   *  through the RemoteDesktop session. */
   virtualKey (code: number, pressed: boolean): void {
     this.send(`vkey ${code} ${pressed ? 1 : 0}`)
   }

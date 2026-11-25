@@ -1,3 +1,4 @@
+import { RemoteDesktopClient } from './remote-desktop';
 /** Availability of the compositor globals the host uses. */
 export interface HostFeatures {
     layerShell: boolean;
@@ -14,6 +15,10 @@ export interface HostFeatures {
     /** Windows are tracked through a KWin script, because the compositor lacks
      *  foreign-toplevel management. Untested on Plasma. */
     kwinScript: boolean;
+    /** Keys and pointer warps can go through the RemoteDesktop portal and
+     *  libei, because the compositor lacks the virtual keyboard protocol. A
+     *  session needs the user's approval. Untested on Plasma. */
+    remoteDesktop: boolean;
 }
 /** An output in global logical coordinates. */
 export interface WaylandOutput {
@@ -135,6 +140,21 @@ export declare function layerShellUsable(features: HostFeatures | null): boolean
 /** How the host follows the target's focus and bounds, or null when it
  *  cannot. Without one, an XWayland target can still be tracked through X11. */
 export declare function windowTracking(features: HostFeatures | null): 'foreign-toplevel' | 'kwin-script' | null;
+/** How each native capability is provided, or null where it is not. A
+ *  `remote-desktop` backend works only while a portal session is active.
+ *  `uinput` keys combine with physically held modifiers. */
+export interface NativeBackends {
+    tracking: 'foreign-toplevel' | 'kwin-script' | null;
+    keys: 'virtual-keyboard' | 'uinput' | 'remote-desktop' | null;
+    pointer: 'virtual-pointer' | 'remote-desktop' | null;
+    capture: 'screencopy' | null;
+}
+export declare function nativeBackends(features: HostFeatures | null): NativeBackends;
+/** Whether the layer-shell backend can run without an X server: overlays as
+ *  layer surfaces, the target tracked natively, and keys typed into it.
+ *  Reading input additionally needs access to /dev/input, which only a
+ *  running host can tell (`waylandNative.inputDevices`). */
+export declare function nativeModeUsable(features: HostFeatures | null): boolean;
 /** Synchronously asks the compositor which globals it offers. Returns null when
  *  the host is missing, no Wayland compositor is reachable, or the probe fails.
  *  Safe to call before Electron's `ready` event, so an app can choose its Ozone
@@ -151,6 +171,7 @@ export declare class WaylandHost {
     readonly toplevels: Map<number, ToplevelInfo>;
     clipboardText: string | null;
     clipboardHtml: string | null;
+    readonly remoteDesktop: RemoteDesktopClient;
     private child;
     private stopped;
     private readonly surfaceListeners;
@@ -216,8 +237,9 @@ export declare class WaylandHost {
     writeClipboard(text: string, html?: string): void;
     /** Reads keyboards and mice from evdev while there are listeners. */
     onEvdev(listener: (event: EvdevEvent) => void): () => void;
-    /** Presses or releases an evdev key on the host's virtual keyboard, or on
-     *  its uinput keyboard where the compositor offers no virtual keyboard. */
+    /** Presses or releases an evdev key on the host's virtual keyboard, on its
+     *  uinput keyboard where the compositor offers no virtual keyboard, or else
+     *  through the RemoteDesktop session. */
     virtualKey(code: number, pressed: boolean): void;
     warpPointer(x: number, y: number): void;
     /** Captures a logical rectangle into `path` as BGRA. Resolves to the pixel

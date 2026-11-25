@@ -2,7 +2,10 @@
   'variables': {
     'wayland_host%': '<!(node -e "try{require(\'child_process\').execSync(\'pkg-config --exists wayland-client wayland-cursor xkbcommon wayland-scanner\');console.log(process.platform===\'linux\'?1:0)}catch{console.log(0)}")',
     # Optional: KWin window tracking needs libdbus, which Electron links anyway.
-    'wayland_dbus%': '<!(node -e "try{require(\'child_process\').execSync(\'pkg-config --exists dbus-1\');console.log(1)}catch{console.log(0)}")'
+    'wayland_dbus%': '<!(node -e "try{require(\'child_process\').execSync(\'pkg-config --exists dbus-1\');console.log(1)}catch{console.log(0)}")',
+    # Optional: injection through the RemoteDesktop portal. Only the headers
+    # are needed; the host loads libei at run time.
+    'wayland_libei%': '<!(node -e "try{require(\'child_process\').execSync(\'pkg-config --exists libei-1.0\');console.log(1)}catch{console.log(0)}")'
   },
   'targets': [
     {
@@ -131,6 +134,20 @@
               'link_settings': {
                 'libraries': [
                   '<!@(pkg-config --libs dbus-1)'
+                ]
+              }
+            }],
+            ['wayland_dbus==1 and wayland_libei==1', {
+              'defines': [
+                'HAVE_REMOTE_DESKTOP'
+              ],
+              'cflags': ['<!@(pkg-config --cflags libei-1.0)'],
+              'sources': [
+                'src/lib/wayland/remote-desktop.c'
+              ],
+              'link_settings': {
+                'libraries': [
+                  '-ldl'
                 ]
               }
             }]

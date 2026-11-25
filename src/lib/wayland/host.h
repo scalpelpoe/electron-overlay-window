@@ -54,4 +54,28 @@ static inline void kwin_start(void) {}
 static inline bool kwin_activate(uint32_t tid) { (void)tid; return false; }
 #endif
 
+#ifdef HAVE_REMOTE_DESKTOP
+/* Input injection through the RemoteDesktop portal and libei
+ * (remote-desktop.c). */
+bool rd_available(void);
+/* Asks the portal for a session; `restore_token` may be NULL. Reports
+ * progress with `remote-desktop` events. */
+void rd_start(const char *restore_token);
+void rd_stop(void);
+/* Return false when no session device can send the event. */
+bool rd_key(uint32_t code, bool pressed);
+bool rd_warp(double x, double y);
+/* The libei fd, -1 while not connected. */
+int rd_fd(void);
+void rd_dispatch(void);
+#else
+static inline bool rd_available(void) { return false; }
+static inline void rd_start(const char *restore_token) { (void)restore_token; }
+static inline void rd_stop(void) {}
+static inline bool rd_key(uint32_t code, bool pressed) { (void)code; (void)pressed; return false; }
+static inline bool rd_warp(double x, double y) { (void)x; (void)y; return false; }
+static inline int rd_fd(void) { return -1; }
+static inline void rd_dispatch(void) {}
+#endif
+
 #endif

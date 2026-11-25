@@ -4,11 +4,14 @@ exports.WaylandHost = void 0;
 exports.hostExecutablePath = hostExecutablePath;
 exports.layerShellUsable = layerShellUsable;
 exports.windowTracking = windowTracking;
+exports.nativeBackends = nativeBackends;
+exports.nativeModeUsable = nativeModeUsable;
 exports.probeWaylandHost = probeWaylandHost;
 const node_child_process_1 = require("node:child_process");
 const node_fs_1 = require("node:fs");
 const node_path_1 = require("node:path");
 const node_readline_1 = require("node:readline");
+const remote_desktop_1 = require("./remote-desktop");
 const LOG_PREFIX = '[electron-overlay-window] wayland:';
 const RESTART_DELAY_MS = 1000;
 // Probes give up within about a second in the host; a capture waits for the
@@ -38,6 +41,28 @@ function windowTracking(features) {
     if (features?.kwinScript)
         return 'kwin-script';
     return null;
+}
+function nativeBackends(features) {
+    return {
+        tracking: windowTracking(features),
+        keys: features?.virtualKeyboard
+            ? 'virtual-keyboard'
+            : features?.uinput
+                ? 'uinput'
+                : features?.remoteDesktop
+                    ? 'remote-desktop'
+                    : null,
+        pointer: features?.virtualPointer ? 'virtual-pointer' : features?.remoteDesktop ? 'remote-desktop' : null,
+        capture: features?.screencopy ? 'screencopy' : null
+    };
+}
+/** Whether the layer-shell backend can run without an X server: overlays as
+ *  layer surfaces, the target tracked natively, and keys typed into it.
+ *  Reading input additionally needs access to /dev/input, which only a
+ *  running host can tell (`waylandNative.inputDevices`). */
+function nativeModeUsable(features) {
+    const backends = nativeBackends(features);
+    return layerShellUsable(features) && backends.tracking !== null && backends.keys !== null;
 }
 /** Synchronously asks the compositor which globals it offers. Returns null when
  *  the host is missing, no Wayland compositor is reachable, or the probe fails.
@@ -79,6 +104,7 @@ class WaylandHost {
         this.toplevels = new Map();
         this.clipboardText = null;
         this.clipboardHtml = null;
+        this.remoteDesktop = new remote_desktop_1.RemoteDesktopClient((line) => this.send(line));
         this.child = null;
         this.stopped = false;
         this.surfaceListeners = new Map();
@@ -136,6 +162,7 @@ class WaylandHost {
             resolve(null);
         this.pendingCaptures.clear();
         this.pendingProbes.clear();
+        this.remoteDesktop.abandon();
         this.evdevDevices = 0;
         const held = [...this.heldEvdev];
         this.heldEvdev.clear();
@@ -180,6 +207,7 @@ class WaylandHost {
                 if (this.stopped)
                     return;
                 this.spawn();
+                this.remoteDesktop.restarted();
                 for (const listener of this.restartListeners)
                     listener();
             }, RESTART_DELAY_MS);
@@ -256,6 +284,10 @@ class WaylandHost {
                 resolve?.(event.x === null || event.y === null ? null : { x: event.x, y: event.y });
                 break;
             }
+            case 'remote-desktop':
+            case 'remote-desktop-token':
+                this.remoteDesktop.handle(event);
+                break;
         }
     }
     /** Returns false when there is no host to send to. */
@@ -363,8 +395,9 @@ class WaylandHost {
                 this.send('evdev off');
         };
     }
-    /** Presses or releases an evdev key on the host's virtual keyboard, or on
-     *  its uinput keyboard where the compositor offers no virtual keyboard. */
+    /** Presses or releases an evdev key on the host's virtual keyboard, on its
+     *  uinput keyboard where the compositor offers no virtual keyboard, or else
+     *  through the RemoteDesktop session. */
     virtualKey(code, pressed) {
         this.send(`vkey ${code} ${pressed ? 1 : 0}`);
     }
