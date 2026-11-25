@@ -7,6 +7,8 @@ export interface HostFeatures {
     cursorShape: boolean;
     viewporter: boolean;
     virtualKeyboard: boolean;
+    /** /dev/uinput is writable, for typing without a virtual keyboard. */
+    uinput: boolean;
     virtualPointer: boolean;
     screencopy: boolean;
 }
@@ -200,7 +202,8 @@ export declare class WaylandHost {
     writeClipboard(text: string, html?: string): void;
     /** Reads keyboards and mice from evdev while there are listeners. */
     onEvdev(listener: (event: EvdevEvent) => void): () => void;
-    /** Presses or releases an evdev key on the host's virtual keyboard. */
+    /** Presses or releases an evdev key on the host's virtual keyboard, or on
+     *  its uinput keyboard where the compositor offers no virtual keyboard. */
     virtualKey(code: number, pressed: boolean): void;
     warpPointer(x: number, y: number): void;
     /** Captures a logical rectangle into `path` as BGRA. Resolves to the pixel

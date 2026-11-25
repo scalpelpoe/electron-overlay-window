@@ -20,9 +20,11 @@ therefore a separate process with its own Wayland connection:
 - For input directed at the target, none of which goes through XWayland: the
   host reads keys and buttons from evdev (`/dev/input`, which needs the
   `input` group, since no Wayland protocol exposes another client's input),
-  types with `zwp_virtual_keyboard_v1`, moves the pointer with
-  `zwlr_virtual_pointer_v1`, captures with `zwlr_screencopy_manager_v1`, and
-  finds the pointer by briefly mapping an input-only surface over every output.
+  types with `zwp_virtual_keyboard_v1` (or, where the compositor lacks it, a
+  uinput keyboard, which needs write access to `/dev/uinput`), moves the
+  pointer with `zwlr_virtual_pointer_v1`, captures with
+  `zwlr_screencopy_manager_v1`, and finds the pointer by briefly mapping an
+  input-only surface over every output.
 
 `protocols/` holds the protocol XML, copied unchanged from wayland-protocols,
 wlr-protocols and wlroots. The build generates the C glue from it with
@@ -73,7 +75,7 @@ client, `<tid>` a toplevel id chosen by the host. Text payloads are base64.
 | `clipboard-set <text> <html\|->` | Own the selection with text, and optionally HTML. |
 | `clipboard-clear` | Clear the selection. |
 | `evdev on\|off` | Start or stop reading keyboards and mice from `/dev/input`. Devices that appear later are opened too. |
-| `vkey <code> <0\|1>` | Release or press evdev key `code` on a virtual keyboard that uses the seat's keymap. The host keeps its modifier state. |
+| `vkey <code> <0\|1>` | Release or press evdev key `code` on a virtual keyboard that uses the seat's keymap. The host keeps its modifier state. Without `zwp_virtual_keyboard_manager_v1` the key goes to a uinput keyboard instead, created on `evdev on` or the first `vkey`; it supports codes below `BTN_MISC` and is never read back as evdev input. |
 | `warp <x> <y>` | Move the pointer to a global logical position with a virtual pointer. |
 | `capture <id> <x> <y> <w> <h> <path>` | Capture a global logical rectangle, which must lie within one output, without the cursor, into a new file at `path` (the rest of the line). |
 | `probe <id>` | Find the pointer: map a transparent input surface over every output on the overlay layer until one receives `wl_pointer.enter`, then remove them. |
@@ -84,7 +86,7 @@ JSON objects with an `ev` field.
 
 | Event | Fields |
 | --- | --- |
-| `ready` | `layerShell`, `layerShellVersion`, `foreignToplevel`, `dataControl`, `cursorShape`, `viewporter`, `virtualKeyboard`, `virtualPointer`, `screencopy`: availability of each global. Sent once after the initial roundtrips. |
+| `ready` | `layerShell`, `layerShellVersion`, `foreignToplevel`, `dataControl`, `cursorShape`, `viewporter`, `virtualKeyboard`, `virtualPointer`, `screencopy`: availability of each global; `uinput`: whether `/dev/uinput` is writable. Sent once after the initial roundtrips. |
 | `outputs` | `outputs`: array of `{ name, description, x, y, width, height, scale }` in logical coordinates. Sent after `ready` and whenever an output changes. |
 | `configure` | `sid`, `width`, `height`: the size the compositor assigned. Sent for every new layer surface, which starts empty unless a buffer was held for it, and when the size changes. |
 | `closed` | `sid`: the compositor closed the layer surface, for example because its output disappeared. The surface is hidden. |

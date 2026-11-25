@@ -7,6 +7,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <linux/input.h>
+#include <linux/uinput.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -46,6 +47,7 @@
 #define REPEAT_BURST_MAX 32
 #define SEAT_GLOBALS_MAX 16
 #define EVDEV_DIR "/dev/input"
+#define UINPUT_PATH "/dev/uinput"
 #define PROBE_NAMESPACE NAMESPACE "-probe"
 /* How long probe surfaces may take to be configured, and how long the pointer
  * then has to enter one. */
@@ -554,6 +556,11 @@ static struct host {
 	char *vk_keymap_text; /* the keymap uploaded to vk */
 	bool vk_default_keymap; /* vk was created before the seat sent a keymap */
 
+	/* uinput keyboard, for compositors without a virtual keyboard. */
+	int uinput_fd;
+	bool uinput_failed;
+	char uinput_phys[64]; /* identifies it among the evdev devices */
+
 	struct zwlr_virtual_pointer_manager_v1 *vp_manager;
 	uint32_t vp_manager_global;
 	/* Pointer without an output, for warps with virtual-pointer v1 and for
@@ -581,6 +588,7 @@ static void probe_output_removed(struct output *output);
 static bool probe_pointer_enter(struct wl_surface *wl, wl_fixed_t x, wl_fixed_t y);
 static void vk_keymap_changed(void);
 static void vk_destroy(void);
+static bool uinput_ensure(void);
 static void vp_destroy_all(void);
 
 /* Events */
@@ -2632,6 +2640,9 @@ static bool evdev_caps_wanted(const struct evdev_caps *caps)
 
 static bool evdev_is_wanted(int fd)
 {
+	char phys[sizeof(host.uinput_phys)] = { 0 };
+	if (ioctl(fd, EVIOCGPHYS(sizeof(phys) - 1), phys) > 0 && strcmp(phys, host.uinput_phys) == 0)
+		return false;
 	struct evdev_caps caps = { 0 };
 	if (ioctl(fd, EVIOCGBIT(0, sizeof(caps.types)), caps.types) < 0)
 		return false;
@@ -2669,6 +2680,20 @@ static bool sysfs_read_bits(const char *name, const char *cap, unsigned long *bi
  * sysfs is unavailable the device is opened and checked with ioctls. */
 static bool evdev_maybe_wanted(const char *name)
 {
+	char path[PATH_MAX], phys[sizeof(host.uinput_phys)];
+	snprintf(path, sizeof(path), "/sys/class/input/%s/device/phys", name);
+	int fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd >= 0) {
+		ssize_t len = read(fd, phys, sizeof(phys) - 1);
+		close(fd);
+		if (len > 0 && phys[len - 1] == '\n')
+			len--;
+		if (len > 0) {
+			phys[len] = '\0';
+			if (strcmp(phys, host.uinput_phys) == 0)
+				return false;
+		}
+	}
 	struct evdev_caps caps = { 0 };
 	if (!sysfs_read_bits(name, "ev", caps.types, ARRAY_LEN(caps.types)) ||
 	    !sysfs_read_bits(name, "key", caps.keys, ARRAY_LEN(caps.keys)) ||
@@ -2888,6 +2913,10 @@ static void cmd_evdev(char **argv, size_t argc)
 		return;
 	}
 	host.evdev_on = true;
+	/* The compositor adds a uinput device asynchronously and drops keys sent
+	 * before that, so it is created ahead of the first key. */
+	if (!host.vk_manager)
+		uinput_ensure();
 	if (host.evdev_inotify_fd < 0) {
 		host.evdev_inotify_fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
 		if (host.evdev_inotify_fd < 0) {
@@ -3002,6 +3031,78 @@ static void vk_keymap_changed(void)
 	vk_upload(host.keymap);
 }
 
+static void vk_key(uint32_t code, bool pressed)
+{
+	if (!vk_ensure())
+		return;
+	zwp_virtual_keyboard_v1_key(host.vk, now_ms(), code,
+				    pressed ? WL_KEYBOARD_KEY_STATE_PRESSED
+					    : WL_KEYBOARD_KEY_STATE_RELEASED);
+	enum xkb_state_component changed =
+		xkb_state_update_key(host.vk_state, code + 8, pressed ? XKB_KEY_DOWN : XKB_KEY_UP);
+	if (changed)
+		zwp_virtual_keyboard_v1_modifiers(
+			host.vk, xkb_state_serialize_mods(host.vk_state, XKB_STATE_MODS_DEPRESSED),
+			xkb_state_serialize_mods(host.vk_state, XKB_STATE_MODS_LATCHED),
+			xkb_state_serialize_mods(host.vk_state, XKB_STATE_MODS_LOCKED),
+			xkb_state_serialize_layout(host.vk_state, XKB_STATE_LAYOUT_EFFECTIVE));
+	wl_display_flush(host.display);
+}
+
+/* uinput keyboard */
+
+/* Creates a kernel keyboard device the compositor reads like a physical one,
+ * where it offers no virtual keyboard (KWin). Needs write access to
+ * /dev/uinput. Unlike a virtual keyboard, compositors that keep one modifier
+ * state for all keyboards (KWin, Sway keyboard groups) combine its keys with
+ * physically held modifiers, so a held modifier cannot be released for the
+ * target. Not attempted again after a failure. */
+static bool uinput_ensure(void)
+{
+	if (host.uinput_fd >= 0)
+		return true;
+	if (host.uinput_failed)
+		return false;
+	host.uinput_failed = true;
+	int fd = open(UINPUT_PATH, O_WRONLY | O_CLOEXEC);
+	if (fd < 0) {
+		log_msg("uinput: cannot open " UINPUT_PATH ": %s", strerror(errno));
+		return false;
+	}
+	/* EV_REP is left out: compositors repeat keys themselves. */
+	bool ok = ioctl(fd, UI_SET_EVBIT, EV_KEY) == 0 && ioctl(fd, UI_SET_EVBIT, EV_SYN) == 0;
+	for (int code = KEY_ESC; ok && code < BTN_MISC; code++)
+		ok = ioctl(fd, UI_SET_KEYBIT, code) == 0;
+	struct uinput_setup setup = { .id = { .bustype = BUS_VIRTUAL, .version = 1 } };
+	snprintf(setup.name, sizeof(setup.name), "overlay-wayland-host keyboard");
+	ok = ok && ioctl(fd, UI_SET_PHYS, host.uinput_phys) == 0 &&
+	     ioctl(fd, UI_DEV_SETUP, &setup) == 0 && ioctl(fd, UI_DEV_CREATE) == 0;
+	if (!ok) {
+		log_msg("uinput: cannot create a keyboard: %s", strerror(errno));
+		close(fd);
+		return false;
+	}
+	host.uinput_fd = fd;
+	host.uinput_failed = false;
+	return true;
+}
+
+static void uinput_key(uint32_t code, bool pressed)
+{
+	if (code == 0 || code >= BTN_MISC) {
+		log_msg("vkey: key %u is not on the uinput keyboard", code);
+		return;
+	}
+	if (!uinput_ensure())
+		return;
+	struct input_event events[2] = {
+		{ .type = EV_KEY, .code = (uint16_t)code, .value = pressed },
+		{ .type = EV_SYN, .code = SYN_REPORT },
+	};
+	if (!write_all(host.uinput_fd, events, sizeof(events)))
+		log_msg("uinput: %s", strerror(errno));
+}
+
 static void cmd_vkey(char **argv, size_t argc)
 {
 	uint32_t code, state;
@@ -3010,20 +3111,10 @@ static void cmd_vkey(char **argv, size_t argc)
 		log_msg("vkey: invalid arguments");
 		return;
 	}
-	if (!vk_ensure())
-		return;
-	zwp_virtual_keyboard_v1_key(host.vk, now_ms(), code,
-				    state ? WL_KEYBOARD_KEY_STATE_PRESSED
-					  : WL_KEYBOARD_KEY_STATE_RELEASED);
-	enum xkb_state_component changed =
-		xkb_state_update_key(host.vk_state, code + 8, state ? XKB_KEY_DOWN : XKB_KEY_UP);
-	if (changed)
-		zwp_virtual_keyboard_v1_modifiers(
-			host.vk, xkb_state_serialize_mods(host.vk_state, XKB_STATE_MODS_DEPRESSED),
-			xkb_state_serialize_mods(host.vk_state, XKB_STATE_MODS_LATCHED),
-			xkb_state_serialize_mods(host.vk_state, XKB_STATE_MODS_LOCKED),
-			xkb_state_serialize_layout(host.vk_state, XKB_STATE_LAYOUT_EFFECTIVE));
-	wl_display_flush(host.display);
+	if (host.vk_manager)
+		vk_key(code, state == 1);
+	else
+		uinput_key(code, state == 1);
 }
 
 /* Virtual pointer */
@@ -4099,6 +4190,7 @@ static void emit_ready(void)
 	ev_bool("cursorShape", host.cursor_shape_manager != NULL);
 	ev_bool("viewporter", host.viewporter != NULL);
 	ev_bool("virtualKeyboard", host.vk_manager != NULL);
+	ev_bool("uinput", access(UINPUT_PATH, W_OK) == 0);
 	ev_bool("virtualPointer", host.vp_manager != NULL);
 	ev_bool("screencopy", host.screencopy != NULL);
 	ev_end();
@@ -4233,6 +4325,9 @@ int main(int argc, char **argv)
 	host.repeat_fd = -1;
 	host.evdev_inotify_fd = -1;
 	host.evdev_reported = -1;
+	host.uinput_fd = -1;
+	snprintf(host.uinput_phys, sizeof(host.uinput_phys), "overlay-wayland-host/%ld",
+		 (long)getpid());
 
 	host.xkb_context = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
 	if (!host.xkb_context) {

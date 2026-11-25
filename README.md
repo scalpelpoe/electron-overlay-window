@@ -61,9 +61,11 @@ app.whenReady().then(() => {
 - Electron's `globalShortcut` does not work on Wayland, and nothing outside
   the compositor sees the target's input. `waylandNative` reads keys, buttons
   and the wheel from evdev while the target has focus (the user needs read
-  access to `/dev/input`), types with a virtual keyboard, warps and finds the
-  pointer, and captures screen regions. `setLayerShortcutHandler` receives keys
-  typed into an overlay. evdev cannot keep a key from the target.
+  access to `/dev/input`), types with a virtual keyboard (or, where the
+  compositor has none, a uinput keyboard, which needs write access to
+  `/dev/uinput`), warps and finds the pointer, and captures screen regions.
+  `setLayerShortcutHandler` receives keys typed into an overlay. evdev cannot
+  keep a key from the target.
 - IME composition, tooltips and native context menus are unavailable in
   offscreen windows.
 

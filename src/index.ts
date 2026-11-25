@@ -112,10 +112,12 @@ export const waylandNative = {
   inputDevices (): number {
     return WaylandHost.get()?.evdevDevices ?? 0
   },
-  /** Presses or releases an evdev key, delivered to the focused window. */
+  /** Presses or releases an evdev key, delivered to the focused window.
+   *  Without a virtual keyboard (KWin) this needs write access to
+   *  /dev/uinput, and keys combine with physically held modifiers. */
   key (code: number, pressed: boolean): boolean {
     const host = WaylandHost.get()
-    if (!host?.features?.virtualKeyboard) return false
+    if (!host?.features?.virtualKeyboard && !host?.features?.uinput) return false
     host.virtualKey(code, pressed)
     return true
   },

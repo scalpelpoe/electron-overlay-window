@@ -353,7 +353,8 @@ class WaylandHost {
                 this.send('evdev off');
         };
     }
-    /** Presses or releases an evdev key on the host's virtual keyboard. */
+    /** Presses or releases an evdev key on the host's virtual keyboard, or on
+     *  its uinput keyboard where the compositor offers no virtual keyboard. */
     virtualKey(code, pressed) {
         this.send(`vkey ${code} ${pressed ? 1 : 0}`);
     }

@@ -41,7 +41,9 @@ export declare const waylandNative: {
     listen(listener: (event: NativeInputEvent) => void): (() => void) | null;
     /** Number of evdev devices being read; 0 usually means no permission. */
     inputDevices(): number;
-    /** Presses or releases an evdev key, delivered to the focused window. */
+    /** Presses or releases an evdev key, delivered to the focused window.
+     *  Without a virtual keyboard (KWin) this needs write access to
+     *  /dev/uinput, and keys combine with physically held modifiers. */
     key(code: number, pressed: boolean): boolean;
     warpPointer(point: {
         x: number;
