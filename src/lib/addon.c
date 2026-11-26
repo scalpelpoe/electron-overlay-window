@@ -308,6 +308,55 @@ napi_value AddonStopHook(napi_env _env, napi_callback_info _info) {
   return NULL;
 }
 
+#ifdef __linux__
+napi_value AddonFindWindowBounds(napi_env env, napi_callback_info info) {
+  napi_status status;
+  size_t argc = 1;
+  napi_value argv[1];
+  status = napi_get_cb_info(env, info, &argc, argv, NULL, NULL);
+  NAPI_THROW_IF_FAILED(env, status, NULL);
+
+  size_t length;
+  status = napi_get_value_string_utf8(env, argv[0], NULL, 0, &length);
+  NAPI_THROW_IF_FAILED(env, status, NULL);
+  char* title = malloc(sizeof(char) * (length + 1));
+  status = napi_get_value_string_utf8(env, argv[0], title, length + 1, NULL);
+  NAPI_THROW_IF_FAILED(env, status, NULL);
+
+  struct ow_window_bounds bounds;
+  bool found = ow_find_window_bounds(title, &bounds);
+  free(title);
+  if (!found) {
+    napi_value result;
+    status = napi_get_null(env, &result);
+    NAPI_THROW_IF_FAILED(env, status, NULL);
+    return result;
+  }
+
+  napi_value result;
+  napi_value value;
+  status = napi_create_object(env, &result);
+  NAPI_THROW_IF_FAILED(env, status, NULL);
+  status = napi_create_int32(env, bounds.x, &value);
+  NAPI_THROW_IF_FAILED(env, status, NULL);
+  status = napi_set_named_property(env, result, "x", value);
+  NAPI_THROW_IF_FAILED(env, status, NULL);
+  status = napi_create_int32(env, bounds.y, &value);
+  NAPI_THROW_IF_FAILED(env, status, NULL);
+  status = napi_set_named_property(env, result, "y", value);
+  NAPI_THROW_IF_FAILED(env, status, NULL);
+  status = napi_create_uint32(env, bounds.width, &value);
+  NAPI_THROW_IF_FAILED(env, status, NULL);
+  status = napi_set_named_property(env, result, "width", value);
+  NAPI_THROW_IF_FAILED(env, status, NULL);
+  status = napi_create_uint32(env, bounds.height, &value);
+  NAPI_THROW_IF_FAILED(env, status, NULL);
+  status = napi_set_named_property(env, result, "height", value);
+  NAPI_THROW_IF_FAILED(env, status, NULL);
+  return result;
+}
+#endif
+
 void AddonCleanUp(void* arg) {
   ow_stop_hook();
 }
@@ -350,6 +399,13 @@ NAPI_MODULE_INIT() {
   NAPI_FATAL_IF_FAILED(status, "NAPI_MODULE_INIT", "napi_create_function");
   status = napi_set_named_property(env, exports, "stopHook", export_fn);
   NAPI_FATAL_IF_FAILED(status, "NAPI_MODULE_INIT", "napi_set_named_property");
+
+#ifdef __linux__
+  status = napi_create_function(env, NULL, 0, AddonFindWindowBounds, NULL, &export_fn);
+  NAPI_FATAL_IF_FAILED(status, "NAPI_MODULE_INIT", "napi_create_function");
+  status = napi_set_named_property(env, exports, "findWindowBounds", export_fn);
+  NAPI_FATAL_IF_FAILED(status, "NAPI_MODULE_INIT", "napi_set_named_property");
+#endif
 
   status = napi_add_env_cleanup_hook(env, AddonCleanUp, NULL);
   NAPI_FATAL_IF_FAILED(status, "NAPI_MODULE_INIT", "napi_add_env_cleanup_hook");
