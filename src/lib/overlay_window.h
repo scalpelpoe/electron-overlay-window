@@ -76,6 +76,13 @@ void ow_focus_target();
 
 void ow_emit_event(struct ow_event* event);
 
+#ifdef __linux__
+// Finds an X11 window by title and reports its root-relative bounds. Uses a
+// private connection so it is safe to call from the Node thread while the
+// tracker hook runs on its own thread.
+bool ow_find_window_bounds(const char* title, struct ow_window_bounds* bounds);
+#endif
+
 void ow_screenshot(uint8_t* out, uint32_t width, uint32_t height);
 
 #ifdef __cplusplus
