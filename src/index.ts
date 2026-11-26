@@ -20,6 +20,19 @@ export {
 } from './wayland/layer-window'
 export { setLayerShortcutHandler, type LayerShortcutKey } from './wayland/layer-window'
 export type { NativeInputEvent } from './wayland/native-input'
+export { FocusArbiter, type TrackerEvent } from './wayland/tracker'
+
+/** Follows the target for the layer-shell backend. */
+export interface LayerTracker {
+  setTitles(titles: string[]): void
+  clear(): void
+  focusTarget(): void
+  stop(): void
+}
+
+/** Builds an app's own layer-shell tracker, for example one that reads exact
+ *  geometry from a compositor IPC. It reports through `emit`. */
+export type LayerTrackerFactory = (titles: string[], emit: (event: TrackerEvent) => void) => LayerTracker
 
 interface AddonExports {
   start(
@@ -176,7 +189,8 @@ class OverlayControllerGlobal {
   private macTitleBarHeight = 0
   private attachOptions: AttachOptions = {}
   private layerShell = false
-  private tracker: ToplevelTracker | null = null
+  private tracker: LayerTracker | null = null
+  private createLayerTracker: LayerTrackerFactory | undefined
   private x11Arbiter: FocusArbiter | null = null
   // Target titles until the layer-shell tracker starts.
   private layerTitles: string[] = []
@@ -362,11 +376,13 @@ class OverlayControllerGlobal {
    * `--ozone-platform=wayland`; call before `attachByTitle`. Overlay windows
    * must be created with `LAYER_SHELL_WEB_PREFERENCES`. Returns false when the
    * compositor lacks layer-shell v4 or the host is not installed.
+   * `createTracker` replaces the built-in target tracking.
    */
-  useLayerShell (): boolean {
+  useLayerShell (createTracker?: LayerTrackerFactory): boolean {
     if (this.isInitialized) throw new Error('Call useLayerShell before attaching.')
     if (!isLinux || !layerShellUsable(probeWaylandHost())) return false
     this.layerShell = WaylandHost.start() !== null
+    this.createLayerTracker = createTracker
     return this.layerShell
   }
 
@@ -480,6 +496,10 @@ class OverlayControllerGlobal {
       titles = this.layerTitles
       if (!host.features) {
         console.error('[electron-overlay-window] the Wayland host did not start; the target is not tracked')
+        return
+      }
+      if (this.createLayerTracker) {
+        this.tracker = this.createLayerTracker(titles, (event) => this.emitTrackerEvent(event))
         return
       }
       if (host.features.foreignToplevel) {

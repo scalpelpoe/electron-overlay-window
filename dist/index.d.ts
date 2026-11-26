@@ -1,10 +1,22 @@
 import { EventEmitter } from 'node:events';
 import { BrowserWindow, Rectangle, BrowserWindowConstructorOptions, WebPreferences } from 'electron';
+import { type TrackerEvent } from './wayland/tracker';
 import { type NativeInputEvent } from './wayland/native-input';
 export { layerShellUsable, probeWaylandHost, type HostFeatures, type WaylandOutput } from './wayland/host';
 export { adoptLayerWindow, getLayerWindow, getLayerPointer, releaseLayerKeyboards, type LayerWindow, type LayerWindowOptions } from './wayland/layer-window';
 export { setLayerShortcutHandler, type LayerShortcutKey } from './wayland/layer-window';
 export type { NativeInputEvent } from './wayland/native-input';
+export { FocusArbiter, type TrackerEvent } from './wayland/tracker';
+/** Follows the target for the layer-shell backend. */
+export interface LayerTracker {
+    setTitles(titles: string[]): void;
+    clear(): void;
+    focusTarget(): void;
+    stop(): void;
+}
+/** Builds an app's own layer-shell tracker, for example one that reads exact
+ *  geometry from a compositor IPC. It reports through `emit`. */
+export type LayerTrackerFactory = (titles: string[], emit: (event: TrackerEvent) => void) => LayerTracker;
 export interface AttachEvent {
     hasAccess: boolean | undefined;
     isFullscreen: boolean | undefined;
@@ -85,6 +97,7 @@ declare class OverlayControllerGlobal {
     private attachOptions;
     private layerShell;
     private tracker;
+    private createLayerTracker;
     private x11Arbiter;
     private layerTitles;
     readonly events: EventEmitter<[never]>;
@@ -102,8 +115,9 @@ declare class OverlayControllerGlobal {
      * `--ozone-platform=wayland`; call before `attachByTitle`. Overlay windows
      * must be created with `LAYER_SHELL_WEB_PREFERENCES`. Returns false when the
      * compositor lacks layer-shell v4 or the host is not installed.
+     * `createTracker` replaces the built-in target tracking.
      */
-    useLayerShell(): boolean;
+    useLayerShell(createTracker?: LayerTrackerFactory): boolean;
     get isLayerShell(): boolean;
     /**
      * Create a dummy window to calculate the title bar height on Mac. We use

@@ -1,6 +1,6 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.OverlayController = exports.waylandClipboard = exports.waylandNative = exports.LAYER_SHELL_WEB_PREFERENCES = exports.OVERLAY_WINDOW_OPTS = exports.setLayerShortcutHandler = exports.releaseLayerKeyboards = exports.getLayerPointer = exports.getLayerWindow = exports.adoptLayerWindow = exports.probeWaylandHost = exports.layerShellUsable = void 0;
+exports.OverlayController = exports.waylandClipboard = exports.waylandNative = exports.LAYER_SHELL_WEB_PREFERENCES = exports.OVERLAY_WINDOW_OPTS = exports.FocusArbiter = exports.setLayerShortcutHandler = exports.releaseLayerKeyboards = exports.getLayerPointer = exports.getLayerWindow = exports.adoptLayerWindow = exports.probeWaylandHost = exports.layerShellUsable = void 0;
 const node_events_1 = require("node:events");
 const node_path_1 = require("node:path");
 const throttle_debounce_1 = require("throttle-debounce");
@@ -21,6 +21,8 @@ Object.defineProperty(exports, "getLayerPointer", { enumerable: true, get: funct
 Object.defineProperty(exports, "releaseLayerKeyboards", { enumerable: true, get: function () { return layer_window_2.releaseLayerKeyboards; } });
 var layer_window_3 = require("./wayland/layer-window");
 Object.defineProperty(exports, "setLayerShortcutHandler", { enumerable: true, get: function () { return layer_window_3.setLayerShortcutHandler; } });
+var tracker_2 = require("./wayland/tracker");
+Object.defineProperty(exports, "FocusArbiter", { enumerable: true, get: function () { return tracker_2.FocusArbiter; } });
 var EventType;
 (function (EventType) {
     EventType[EventType["EVENT_ATTACH"] = 1] = "EVENT_ATTACH";
@@ -304,13 +306,15 @@ class OverlayControllerGlobal {
      * `--ozone-platform=wayland`; call before `attachByTitle`. Overlay windows
      * must be created with `LAYER_SHELL_WEB_PREFERENCES`. Returns false when the
      * compositor lacks layer-shell v4 or the host is not installed.
+     * `createTracker` replaces the built-in target tracking.
      */
-    useLayerShell() {
+    useLayerShell(createTracker) {
         if (this.isInitialized)
             throw new Error('Call useLayerShell before attaching.');
         if (!isLinux || !(0, host_1.layerShellUsable)((0, host_1.probeWaylandHost)()))
             return false;
         this.layerShell = host_1.WaylandHost.start() !== null;
+        this.createLayerTracker = createTracker;
         return this.layerShell;
     }
     get isLayerShell() {
@@ -411,6 +415,10 @@ class OverlayControllerGlobal {
             titles = this.layerTitles;
             if (!host.features) {
                 console.error('[electron-overlay-window] the Wayland host did not start; the target is not tracked');
+                return;
+            }
+            if (this.createLayerTracker) {
+                this.tracker = this.createLayerTracker(titles, (event) => this.emitTrackerEvent(event));
                 return;
             }
             if (host.features.foreignToplevel) {
