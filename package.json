@@ -21,13 +21,16 @@
   "types": "dist/index.d.ts",
   "scripts": {
     "install": "node-gyp-build",
+    "test:linux-shutdown": "node scripts/test-linux-shutdown.mjs",
     "prebuild": "prebuildify --napi",
-    "demo:electron": "node-gyp rebuild && npx tsc && electron dist/demo/electron-demo.js"
+    "demo:electron": "node-gyp rebuild && npx tsc && electron dist/demo/electron-demo.js",
+    "test": "tsc && node --test \"dist/**/*.test.js\""
   },
   "files": [
     "dist/index.d.ts",
     "dist/index.js",
     "dist/index.js.map",
+    "dist/wayland",
     "binding.gyp",
     "src/lib",
     "prebuilds"

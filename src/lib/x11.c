@@ -2,6 +2,10 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdbool.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <unistd.h>
 #include <xcb/xcb.h>
 #include "overlay_window.h"
 
@@ -30,7 +34,9 @@ struct ow_overlay_window
 
 static xcb_window_t active_window = XCB_WINDOW_NONE;
 static uv_mutex_t target_mutex;
-static bool hook_running = false;
+// Closing the write end wakes the worker without freeing its XCB connection.
+// Created before the worker starts, so an immediate stop cannot be lost.
+static int stop_pipe[2] = {-1, -1};
 // Cleanup also runs when the addon was imported without starting its tracker.
 static bool hook_started = false;
 
@@ -83,12 +89,12 @@ static bool get_title(xcb_window_t wid, char** title) {
   return true;
 }
 
-static bool get_content_bounds(xcb_window_t wid, struct ow_window_bounds* bounds) {
-  xcb_get_geometry_reply_t* geometry = xcb_get_geometry_reply(x_conn, xcb_get_geometry(x_conn, wid), NULL);
+static bool get_content_bounds_conn(xcb_connection_t* conn, xcb_window_t root_win, xcb_window_t wid, struct ow_window_bounds* bounds) {
+  xcb_get_geometry_reply_t* geometry = xcb_get_geometry_reply(conn, xcb_get_geometry(conn, wid), NULL);
   if (geometry == NULL) {
     return false;
   }
-  xcb_translate_coordinates_reply_t* translated = xcb_translate_coordinates_reply(x_conn, xcb_translate_coordinates(x_conn, wid, root, 0, 0), NULL);
+  xcb_translate_coordinates_reply_t* translated = xcb_translate_coordinates_reply(conn, xcb_translate_coordinates(conn, wid, root_win, 0, 0), NULL);
   if (translated == NULL) {
     free(geometry);
     return false;
@@ -101,6 +107,95 @@ static bool get_content_bounds(xcb_window_t wid, struct ow_window_bounds* bounds
   free(translated);
   free(geometry);
   return true;
+}
+
+static bool get_content_bounds(xcb_window_t wid, struct ow_window_bounds* bounds) {
+  return get_content_bounds_conn(x_conn, root, wid, bounds);
+}
+
+/** A window's title property, or NULL. The caller frees it. */
+static char* query_title(xcb_connection_t* conn, xcb_window_t wid, xcb_atom_t name_atom, xcb_atom_t type_atom) {
+  xcb_get_property_reply_t* reply = xcb_get_property_reply(
+    conn, xcb_get_property(conn, 0, wid, name_atom, type_atom, 0, 100000), NULL);
+  if (reply == NULL || reply->format != 8 || reply->value_len == 0) {
+    free(reply);
+    return NULL;
+  }
+  unsigned length = xcb_get_property_value_length(reply);
+  char* title = malloc(sizeof(char) * (length + 1));
+  if (title == NULL) {
+    free(reply);
+    return NULL;
+  }
+  memcpy(title, xcb_get_property_value(reply), length);
+  title[length] = '\0';
+  free(reply);
+  return title;
+}
+
+static bool find_in_tree(xcb_connection_t* conn, xcb_window_t root_win, xcb_window_t parent,
+                         xcb_atom_t name_atom, xcb_atom_t utf8_atom, const char* target,
+                         struct ow_window_bounds* out) {
+  xcb_query_tree_reply_t* tree = xcb_query_tree_reply(conn, xcb_query_tree(conn, parent), NULL);
+  if (tree == NULL) {
+    return false;
+  }
+  xcb_window_t* children = xcb_query_tree_children(tree);
+  int count = xcb_query_tree_children_length(tree);
+  for (int i = 0; i < count; ++i) {
+    char* title = query_title(conn, children[i], name_atom, utf8_atom);
+    if (title == NULL) {
+      title = query_title(conn, children[i], XCB_ATOM_WM_NAME, XCB_ATOM_STRING);
+    }
+    if (title != NULL && strcmp(title, target) == 0) {
+      bool found = get_content_bounds_conn(conn, root_win, children[i], out);
+      free(title);
+      free(tree);
+      return found;
+    }
+    free(title);
+    if (find_in_tree(conn, root_win, children[i], name_atom, utf8_atom, target, out)) {
+      free(tree);
+      return true;
+    }
+  }
+  free(tree);
+  return false;
+}
+
+/** Looks up a window by title using a private X connection. The tracker thread
+ *  owns `x_conn`, so querying from the Node thread needs its own connection.
+ *  This is needed on Wayland compositors that do not maintain X11's
+ *  `_NET_ACTIVE_WINDOW`, where the event hook never sees an ATTACH. */
+bool ow_find_window_bounds(const char* title, struct ow_window_bounds* out) {
+  if (title == NULL || out == NULL) {
+    return false;
+  }
+  xcb_connection_t* conn = xcb_connect(NULL, NULL);
+  if (conn == NULL || xcb_connection_has_error(conn)) {
+    if (conn != NULL) xcb_disconnect(conn);
+    return false;
+  }
+  xcb_screen_t* screen = xcb_setup_roots_iterator(xcb_get_setup(conn)).data;
+  if (screen == NULL) {
+    xcb_disconnect(conn);
+    return false;
+  }
+  xcb_intern_atom_reply_t* name = xcb_intern_atom_reply(
+    conn, xcb_intern_atom(conn, 0, strlen("_NET_WM_NAME"), "_NET_WM_NAME"), NULL);
+  xcb_intern_atom_reply_t* utf8 = xcb_intern_atom_reply(
+    conn, xcb_intern_atom(conn, 0, strlen("UTF8_STRING"), "UTF8_STRING"), NULL);
+  if (name == NULL || utf8 == NULL) {
+    free(name);
+    free(utf8);
+    xcb_disconnect(conn);
+    return false;
+  }
+  bool found = find_in_tree(conn, screen->root, screen->root, name->atom, utf8->atom, title, out);
+  free(name);
+  free(utf8);
+  xcb_disconnect(conn);
+  return found;
 }
 
 static bool is_fullscreen_window(xcb_window_t wid, bool* is_fullscreen) {
@@ -280,7 +375,6 @@ static void hook_thread(void* _arg) {
     x_conn = NULL;
     return;
   }
-  hook_running = true;
   xcb_screen_t* screen = xcb_setup_roots_iterator(xcb_get_setup(x_conn)).data;
   root = screen->root;
 
@@ -321,18 +415,35 @@ static void hook_thread(void* _arg) {
   }
   xcb_flush(x_conn);
 
-  xcb_generic_event_t* event;
-  while (hook_running && (event = xcb_wait_for_event(x_conn))) {
-    event->response_type = event->response_type & ~0x80;
-    hook_proc(event);
-    xcb_flush(x_conn);
-    free(event);
+  struct pollfd fds[] = {
+    { .fd = stop_pipe[0], .events = POLLIN },
+    { .fd = xcb_get_file_descriptor(x_conn), .events = POLLIN },
+  };
+  for (;;) {
+    // Check stop even when XCB already has buffered events, so a busy desktop
+    // cannot starve shutdown. Only this worker disconnects the connection.
+    int stopped = poll(fds, 1, 0);
+    if (stopped > 0 || (stopped < 0 && errno != EINTR)) break;
+    xcb_generic_event_t* event = xcb_poll_for_event(x_conn);
+    if (event) {
+      event->response_type &= ~0x80;
+      hook_proc(event);
+      xcb_flush(x_conn);
+      free(event);
+      continue;
+    }
+    if (xcb_connection_has_error(x_conn)) break;
+    if (poll(fds, 2, -1) < 0 && errno != EINTR) break;
   }
   xcb_disconnect(x_conn);
   x_conn = NULL;
 }
 
 void ow_start_hook(char** target_window_titles, size_t titles_count, void* overlay_window_id) {
+  if (pipe2(stop_pipe, O_CLOEXEC) != 0) {
+    fprintf(stderr, "[electron-overlay-window] shutdown pipe failed\n");
+    return;
+  }
   uv_mutex_init(&target_mutex);
   target_info.titles = target_window_titles;
   target_info.titles_count = titles_count;
@@ -342,6 +453,9 @@ void ow_start_hook(char** target_window_titles, size_t titles_count, void* overl
   if (uv_thread_create(&hook_tid, hook_thread, NULL) == 0) {
     hook_started = true;
   } else {
+    close(stop_pipe[0]);
+    close(stop_pipe[1]);
+    stop_pipe[0] = stop_pipe[1] = -1;
     uv_mutex_destroy(&target_mutex);
   }
 }
@@ -408,12 +522,10 @@ void ow_clear_target(void) {
 void ow_stop_hook(void) {
   if (!hook_started) return;
   hook_started = false;
-  hook_running = false;
-  if (x_conn) {
-    xcb_disconnect(x_conn);
-    x_conn = NULL;
-  }
+  close(stop_pipe[1]);
   uv_thread_join(&hook_tid);
+  close(stop_pipe[0]);
+  stop_pipe[0] = stop_pipe[1] = -1;
   uv_mutex_destroy(&target_mutex);
 }
 
