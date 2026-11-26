@@ -2643,6 +2643,11 @@ static bool evdev_is_wanted(int fd)
 	char phys[sizeof(host.uinput_phys)] = { 0 };
 	if (ioctl(fd, EVIOCGPHYS(sizeof(phys) - 1), phys) > 0 && strcmp(phys, host.uinput_phys) == 0)
 		return false;
+	/* Keys an app injects through ydotoold (KWin has no virtual keyboard)
+	 * must not come back as input and fire its own hotkeys. */
+	char name[128] = { 0 };
+	if (ioctl(fd, EVIOCGNAME(sizeof(name) - 1), name) >= 0 && strcmp(name, "ydotoold virtual device") == 0)
+		return false;
 	struct evdev_caps caps = { 0 };
 	if (ioctl(fd, EVIOCGBIT(0, sizeof(caps.types)), caps.types) < 0)
 		return false;
