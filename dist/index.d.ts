@@ -30,6 +30,7 @@ declare class OverlayControllerGlobal {
     private focusNext;
     private macTitleBarHeight;
     private attachOptions;
+    private tracker;
     readonly events: EventEmitter<[never]>;
     constructor();
     private handleFullscreen;
