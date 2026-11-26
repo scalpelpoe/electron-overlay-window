@@ -20,6 +20,23 @@ interface AddonExports {
   stopHook(): void
 }
 
+/** Follows the target window once attached. */
+interface TargetTracker {
+  setTitles(titles: string[]): void
+  clear(): void
+  /** Returns keyboard focus to the target. */
+  focusTarget(): void
+  stop(): void
+}
+
+/** The native addon's hook, which `attachByTitles` starts. */
+const addonTracker: TargetTracker = {
+  setTitles: (titles) => lib.setTargetTitles(titles),
+  clear: () => lib.clearTarget(),
+  focusTarget: () => lib.focusTarget(),
+  stop: () => lib.stopHook()
+}
+
 enum EventType {
   EVENT_ATTACH = 1,
   EVENT_FOCUS = 2,
@@ -82,6 +99,7 @@ class OverlayControllerGlobal {
   // The height of a title bar on a standard window. Only measured on Mac
   private macTitleBarHeight = 0
   private attachOptions: AttachOptions = {}
+  private tracker: TargetTracker = addonTracker
 
   readonly events = new EventEmitter()
 
@@ -264,7 +282,7 @@ class OverlayControllerGlobal {
   focusTarget () {
     this.focusNext = 'target'
     this.electronWindow?.setIgnoreMouseEvents(true)
-    lib.focusTarget()
+    this.tracker.focusTarget()
   }
 
   attachByTitle (electronWindow: BrowserWindow | undefined, targetWindowTitle: string, options: AttachOptions = {}) {
@@ -301,15 +319,15 @@ class OverlayControllerGlobal {
   }
 
   setTargetTitles (titles: string[]) {
-    lib.setTargetTitles(titles)
+    this.tracker.setTitles(titles)
   }
 
   clearTarget () {
-    lib.clearTarget()
+    this.tracker.clear()
   }
 
   stopHook () {
-    lib.stopHook()
+    this.tracker.stop()
   }
 
   // buffer suitable for use in `nativeImage.createFromBitmap`

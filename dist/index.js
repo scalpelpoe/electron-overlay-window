@@ -7,6 +7,13 @@ const throttle_debounce_1 = require("throttle-debounce");
 const electron_1 = require("electron");
 const electron_2 = require("electron");
 const lib = require('node-gyp-build')((0, node_path_1.join)(__dirname, '..'));
+/** The native addon's hook, which `attachByTitles` starts. */
+const addonTracker = {
+    setTitles: (titles) => lib.setTargetTitles(titles),
+    clear: () => lib.clearTarget(),
+    focusTarget: () => lib.focusTarget(),
+    stop: () => lib.stopHook()
+};
 var EventType;
 (function (EventType) {
     EventType[EventType["EVENT_ATTACH"] = 1] = "EVENT_ATTACH";
@@ -18,16 +25,6 @@ var EventType;
 })(EventType || (EventType = {}));
 const isMac = process.platform === 'darwin';
 const isLinux = process.platform === 'linux';
-function screenToDipRect(rect) {
-    const tl = electron_1.screen.screenToDipPoint({ x: rect.x, y: rect.y });
-    const br = electron_1.screen.screenToDipPoint({ x: rect.x + rect.width, y: rect.y + rect.height });
-    return {
-        x: Math.round(tl.x),
-        y: Math.round(tl.y),
-        width: Math.round(br.x - tl.x),
-        height: Math.round(br.y - tl.y)
-    };
-}
 exports.OVERLAY_WINDOW_OPTS = {
     fullscreenable: true,
     skipTaskbar: true,
@@ -50,6 +47,7 @@ class OverlayControllerGlobal {
         // The height of a title bar on a standard window. Only measured on Mac
         this.macTitleBarHeight = 0;
         this.attachOptions = {};
+        this.tracker = addonTracker;
         this.events = new node_events_1.EventEmitter();
         this.events.on('attach', (e) => {
             this.targetHasFocus = true;
@@ -124,10 +122,6 @@ class OverlayControllerGlobal {
             lastBounds = electron_1.screen.screenToDipRect(this.electronWindow, this.targetBounds);
         }
         else if (isLinux) {
-            // XWayland reports root coordinates in its own scaled screen space. Map
-            // the rect by converting both corners to DIP; dividing the absolute origin
-            // by a scale factor breaks on secondary monitors.
-            //lastBounds = screenToDipRect(lastBounds)
             // XWayland reports physical pixels; convert to DIP (logical) for Electron
             const display = electron_1.screen.getDisplayNearestPoint({ x: lastBounds.x, y: lastBounds.y });
             const scaleFactor = display.scaleFactor || 1;
@@ -220,7 +214,7 @@ class OverlayControllerGlobal {
     focusTarget() {
         this.focusNext = 'target';
         this.electronWindow?.setIgnoreMouseEvents(true);
-        lib.focusTarget();
+        this.tracker.focusTarget();
     }
     attachByTitle(electronWindow, targetWindowTitle, options = {}) {
         this.attachByTitles(electronWindow, [targetWindowTitle], options);
@@ -248,13 +242,13 @@ class OverlayControllerGlobal {
         lib.start(this.electronWindow?.getNativeWindowHandle(), targetWindowTitles, this.handler.bind(this));
     }
     setTargetTitles(titles) {
-        lib.setTargetTitles(titles);
+        this.tracker.setTitles(titles);
     }
     clearTarget() {
-        lib.clearTarget();
+        this.tracker.clear();
     }
     stopHook() {
-        lib.stopHook();
+        this.tracker.stop();
     }
     // buffer suitable for use in `nativeImage.createFromBitmap`
     screenshot() {
